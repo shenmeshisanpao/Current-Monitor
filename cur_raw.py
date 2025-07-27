@@ -166,7 +166,17 @@ class RealTimePlotApp(QMainWindow):
         self.filename = "Run_0000.csv"  # 默认文件名
         self.file_mode = "append"  # 默认文件模式：追加
         self.update_interval = 100  # 默认更新间隔100ms
-        
+
+        # 脉冲提醒相关变量
+        self.pulse_reminder_enabled = True  # 脉冲提醒开关，默认开启
+        self.pulse_reminder_timer = QTimer()  # 脉冲提醒定时器
+        self.pulse_reminder_timer.timeout.connect(self.show_pulse_reminder)
+        self.pulse_reminder_timer.setSingleShot(True)  # 单次触发
+        self.reminder_suppressed = False  # 本轮是否已抑制提醒
+
+        # 鼠标悬停相关属性
+        self.hover_annotation = None       
+
         # 然后创建UI和菜单栏
         self.init_ui()
         self.create_menu_bar()
@@ -217,6 +227,16 @@ class RealTimePlotApp(QMainWindow):
         self.stop_action.setShortcut('Ctrl+T')
         self.stop_action.setEnabled(False)
         run_menu.addAction(self.stop_action)
+
+        run_menu.addSeparator()
+
+        # 脉冲提醒开关菜单项
+        self.pulse_reminder_action = QtWidgets.QAction('Pulse Reminder', self)
+        self.pulse_reminder_action.setCheckable(True)
+        self.pulse_reminder_action.setChecked(True)  # 默认开启
+        self.pulse_reminder_action.triggered.connect(self.toggle_pulse_reminder)
+        self.pulse_reminder_action.setToolTip("Enable/Disable Pulse Reminder")
+        run_menu.addAction(self.pulse_reminder_action)
 
         run_menu.addSeparator()
 
@@ -384,6 +404,9 @@ class RealTimePlotApp(QMainWindow):
         self.ax.set_ylim(0, 10)
         self.ax.legend()  # 显示图例
         self.ax.grid(True, alpha=0.3)
+
+        # 鼠标悬停功能
+        self.setup_mouse_hover()
         
         # 添加到主布局
         main_layout.addLayout(serial_layout)
@@ -728,7 +751,14 @@ class RealTimePlotApp(QMainWindow):
         
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        
+
+        # 重置提醒抑制状态
+        self.reminder_suppressed = False
+
+        # 如果脉冲提醒功能开启，启动10秒后的提醒定时器
+        if self.pulse_reminder_enabled:
+            self.pulse_reminder_timer.start(10 * 1000)  # 10秒后提醒
+                        
         print("Monitoring Started")
     
     def stop_monitoring(self):
@@ -743,6 +773,10 @@ class RealTimePlotApp(QMainWindow):
         
         # 关闭数据文件
         self.close_data_file()
+
+        # 停止脉冲提醒定时器
+        if self.pulse_reminder_timer.isActive():
+            self.pulse_reminder_timer.stop()
         
         # 关闭串口
         if self.serialport1.is_open:
@@ -842,6 +876,183 @@ class RealTimePlotApp(QMainWindow):
             
             print(f"Update interval changed to: {interval}ms")
 
+    def toggle_pulse_reminder(self):
+        """切换脉冲提醒开关"""
+        self.pulse_reminder_enabled = self.pulse_reminder_action.isChecked()
+        status = "enabled" if self.pulse_reminder_enabled else "disabled"
+        print(f"Pulse reminder {status}")
+        
+        # 如果关闭提醒且定时器正在运行，停止定时器
+        if not self.pulse_reminder_enabled and self.pulse_reminder_timer.isActive():
+            self.pulse_reminder_timer.stop()
+
+    def show_pulse_reminder(self):
+        """显示脉冲提醒对话框"""
+        if not self.pulse_reminder_enabled or self.reminder_suppressed:
+            return
+        
+        # 创建自定义对话框
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Pulse Reminder")
+        dialog.setFixedSize(300, 150)
+        dialog.setModal(True)
+        
+        # 设置对话框图标
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+        if os.path.exists(icon_path):
+            dialog.setWindowIcon(QtGui.QIcon(icon_path))
+        
+        layout = QVBoxLayout()
+        
+        # 提醒文本
+        message_label = QLabel("Reminder: Please apply pulse")
+        message_label.setAlignment(QtCore.Qt.AlignCenter)
+        message_label.setStyleSheet("font-size: 14px; font-weight: bold; margin: 10px;")
+        layout.addWidget(message_label)
+        
+        # 按钮布局
+        button_layout = QHBoxLayout()
+        
+        # "本轮内不再提醒"按钮
+        no_more_button = QPushButton("No More in This Run")
+        no_more_button.clicked.connect(lambda: self.handle_reminder_choice(dialog, "no_more"))
+        no_more_button.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 8px;")
+        
+        # "5分钟后再次提醒"按钮
+        remind_later_button = QPushButton("Remind in 5 Minutes")
+        remind_later_button.clicked.connect(lambda: self.handle_reminder_choice(dialog, "remind_later"))
+        remind_later_button.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 8px;")
+        
+        button_layout.addWidget(no_more_button)
+        button_layout.addWidget(remind_later_button)
+        
+        layout.addLayout(button_layout)
+        dialog.setLayout(layout)
+        
+        # 显示对话框
+        dialog.exec_()
+
+    def handle_reminder_choice(self, dialog, choice):
+        """处理用户的提醒选择"""
+        dialog.accept()  # 关闭对话框
+        
+        if choice == "no_more":
+            # 本轮内不再提醒
+            self.reminder_suppressed = True
+            print("Pulse reminder suppressed for this monitoring session")
+        elif choice == "remind_later":
+            # 5分钟后再次提醒
+            self.pulse_reminder_timer.start(5 * 60 * 1000)  # 5分钟 = 300000毫秒
+            print("Pulse reminder will show again in 5 minutes")
+
+    def setup_mouse_hover(self):
+        """设置鼠标悬停功能"""
+        # 创建注释文本框
+        self.hover_annotation = self.ax.annotate(
+            '', 
+            xy=(0, 0), 
+            xytext=(20, 20), 
+            textcoords="offset points",
+            bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.8),
+            arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0"),
+            fontsize=10,
+            visible=False
+        )
+        
+        # 连接鼠标移动事件
+        self.canvas.mpl_connect('motion_notify_event', self.on_hover)
+
+    def on_hover(self, event):
+        """鼠标悬停事件处理"""
+        if not self.run_stat or event.inaxes != self.ax:
+            self.hover_annotation.set_visible(False)
+            self.canvas.draw_idle()
+            return
+        
+        # 获取鼠标位置
+        x_mouse = event.xdata
+        y_mouse = event.ydata
+        
+        if x_mouse is None or y_mouse is None:
+            self.hover_annotation.set_visible(False)
+            self.canvas.draw_idle()
+            return
+        
+        # 找到最接近的数据点
+        closest_point = self.find_closest_point(x_mouse, y_mouse)
+        
+        if closest_point:
+            channel, index, x_val, y_val, time_val = closest_point
+            
+            # 计算运行时间
+            if self.start_time and time_val > 0:
+                runtime = time_val - self.start_time
+                time_str = f"{runtime:.2f}s"
+            else:
+                time_str = "N/A"
+            
+            # 创建显示文本
+            hover_text = f"Channel {channel}\nTime: {time_str}\nCurrent: {y_val:.3f} mA"
+            
+            # 更新注释
+            self.hover_annotation.xy = (x_val, y_val)
+            self.hover_annotation.set_text(hover_text)
+            self.hover_annotation.set_visible(True)
+            
+            # 设置不同通道的颜色
+            if channel == 1:
+                self.hover_annotation.get_bbox_patch().set_facecolor('lightblue')
+            else:
+                self.hover_annotation.get_bbox_patch().set_facecolor('lightcoral')
+        else:
+            self.hover_annotation.set_visible(False)
+        
+        self.canvas.draw_idle()
+
+    def find_closest_point(self, x_mouse, y_mouse):
+        """找到最接近鼠标位置的数据点"""
+        min_distance = float('inf')
+        closest_point = None
+        
+        # 检查通道1的数据点
+        for i in range(len(self.x_data)):
+            x_data_point = self.x_data[i]
+            y_data_point = self.y_data1[i]
+            
+            # 计算距离（考虑坐标轴的比例）
+            x_range = self.ax.get_xlim()[1] - self.ax.get_xlim()[0]
+            y_range = self.ax.get_ylim()[1] - self.ax.get_ylim()[0]
+            
+            # 归一化距离计算
+            dx = (x_mouse - x_data_point) / x_range
+            dy = (y_mouse - y_data_point) / y_range
+            distance = (dx**2 + dy**2)**0.5
+            
+            if distance < min_distance and distance < 0.05:  # 设置敏感度阈值
+                min_distance = distance
+                time_val = self.time_data[i] if hasattr(self, 'time_data') and i < len(self.time_data) else 0
+                closest_point = (1, i, x_data_point, y_data_point, time_val)
+        
+        # 检查通道2的数据点
+        for i in range(len(self.x_data)):
+            x_data_point = self.x_data[i]
+            y_data_point = self.y_data2[i]
+            
+            # 计算距离
+            x_range = self.ax.get_xlim()[1] - self.ax.get_xlim()[0]
+            y_range = self.ax.get_ylim()[1] - self.ax.get_ylim()[0]
+            
+            dx = (x_mouse - x_data_point) / x_range
+            dy = (y_mouse - y_data_point) / y_range
+            distance = (dx**2 + dy**2)**0.5
+            
+            if distance < min_distance and distance < 0.05:
+                min_distance = distance
+                time_val = self.time_data[i] if hasattr(self, 'time_data') and i < len(self.time_data) else 0
+                closest_point = (2, i, x_data_point, y_data_point, time_val)
+        
+        return closest_point
+
     def show_about(self):
         """显示关于对话框"""
         about_dialog = QDialog(self)
@@ -918,7 +1129,7 @@ class RealTimePlotApp(QMainWindow):
             <div style="font-family: Arial, sans-serif; line-height: 1.6;">
             <center>
             <h2 style="color: #2E86AB; margin-bottom: 10px;">Real-Time Current Monitoring System - Dual Channel</h2>
-            <p><b>Version 2025.07.27</b></p>
+            <p><b>Version 2025.07.28</b></p>
             <p>Compatible with 創鴻高精度智能盤面表 DM4D-An-Rs</p>
             <p><b>Developer:</b> Zhicheng Zhang</p>
             <p><b>Email:</b> <a href="mailto:zhangzhicheng@cnncmail.cn">zhangzhicheng@cnncmail.cn</a></p>
@@ -937,7 +1148,13 @@ class RealTimePlotApp(QMainWindow):
             <h3 style="color: #2E86AB;">Update History</h3>
             
             <div style="margin-left: 15px;">
-            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-07-27 (Latest)</h4>
+            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-07-28 (Latest)</h4>
+            <ul style="margin-top: 5px; margin-bottom: 15px;">
+                <li>An intelligent pulse reminder system was added, and its toggle switch is located in the Run menu.</li>
+                <li>Added interactive data point hover functionality to the real-time plot.</li>
+            </ul>
+
+            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-07-27</h4>
             <ul style="margin-top: 5px; margin-bottom: 15px;">
                 <li>Enhanced file naming system with automatic numbering.</li>
                 <li>Auto-increment filename when stopping monitoring.</li>
@@ -1040,14 +1257,14 @@ class RealTimePlotApp(QMainWindow):
         
         # 获取 HTML 文件的绝对路径
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        html_file = os.path.join(current_dir, 'tutorial_dual.html')
+        html_file = os.path.join(current_dir, 'tutorial.html')
         
         if os.path.exists(html_file):
             # 使用 file:// URL 协议
             file_url = QUrl.fromLocalFile(html_file)
             text_browser.setSource(file_url)
         else:
-            text_browser.setHtml("<h1>Error</h1><p>tutorial_dual.html File Not Found</p>")
+            text_browser.setHtml("<h1>Error</h1><p>tutorial.html File Not Found</p>")
         
         close_button = QPushButton("Close")
         close_button.clicked.connect(dialog.accept)
@@ -1169,8 +1386,9 @@ class RealTimePlotApp(QMainWindow):
                 x_labels.append(f"{time_sec:.1f}")
             
             # 设置X轴刻度为运行时间
-            self.ax.set_xticks(range(0, self.data_points, self.data_points//10))
-            self.ax.set_xticklabels([x_labels[i] for i in range(0, self.data_points, self.data_points//10)])
+            tick_indices = range(0, self.data_points, max(1, self.data_points//10))
+            self.ax.set_xticks(tick_indices)
+            self.ax.set_xticklabels([x_labels[i] for i in tick_indices])
             
             # 自动调整Y轴范围 - 考虑两个通道的数据
             all_data = np.concatenate([self.y_data1, self.y_data2])
