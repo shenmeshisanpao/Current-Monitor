@@ -1153,7 +1153,7 @@ class RealTimePlotApp(QMainWindow):
                 <li>Fixed integral calculation precision issue where integration would stop increasing after reaching 1000 mC.</li>
             </ul>
 
-            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-07-28 (Latest)</h4>
+            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-07-28</h4>
             <ul style="margin-top: 5px; margin-bottom: 15px;">
                 <li>An intelligent pulse reminder system was added, and its toggle switch is located in the Run menu.</li>
                 <li>Added interactive data point hover functionality to the real-time plot.</li>
