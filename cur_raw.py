@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Real-time Dual-Channel Current Monitor with PyQt5 and Auto-Save
 # Author: ZhiCheng Zhang <zhangzhicheng@cnncmail.cn>
-# Date: 2025-07-27
+# Date: 2025-07-28
 
 import fcntl  # Linux/Unix系统的文件锁
 import tempfile
