@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Real-time Dual-Channel Current Monitor with PyQt5 and Auto-Save
 # Author: ZhiCheng Zhang <zhangzhicheng@cnncmail.cn>
-# Date: 2025-07-28
+# Date: 2025-07-30
 
 import fcntl  # Linux/Unix系统的文件锁
 import tempfile
@@ -28,7 +28,7 @@ from matplotlib.figure import Figure
 from matplotlib import rcParams
 
 # 设置高精度计算
-getcontext().prec = 5  # 设置Decimal精度为5位小数
+getcontext().prec = 15  # 设置Decimal精度为15位小数
 
 # 设置Matplotlib参数
 rcParams['font.size'] = 8
@@ -1129,7 +1129,7 @@ class RealTimePlotApp(QMainWindow):
             <div style="font-family: Arial, sans-serif; line-height: 1.6;">
             <center>
             <h2 style="color: #2E86AB; margin-bottom: 10px;">Real-Time Current Monitoring System - Dual Channel</h2>
-            <p><b>Version 2025.07.28</b></p>
+            <p><b>Version 2025.07.30</b></p>
             <p>Compatible with 創鴻高精度智能盤面表 DM4D-An-Rs</p>
             <p><b>Developer:</b> Zhicheng Zhang</p>
             <p><b>Email:</b> <a href="mailto:zhangzhicheng@cnncmail.cn">zhangzhicheng@cnncmail.cn</a></p>
@@ -1148,6 +1148,11 @@ class RealTimePlotApp(QMainWindow):
             <h3 style="color: #2E86AB;">Update History</h3>
             
             <div style="margin-left: 15px;">
+            <h4 style=\"color: #4A90E2; margin-bottom: 5px;\"> 2025-07-30 (Latest)</h4>
+            <ul style=\"margin-top: 5px; margin-bottom: 15px;\">
+                <li>Fixed integral calculation precision issue where integration would stop increasing after reaching 1000 mC.</li>
+            </ul>
+
             <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-07-28 (Latest)</h4>
             <ul style="margin-top: 5px; margin-bottom: 15px;">
                 <li>An intelligent pulse reminder system was added, and its toggle switch is located in the Run menu.</li>
