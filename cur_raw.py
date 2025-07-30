@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Real-time Dual-Channel Current Monitor with PyQt5 and Auto-Save
 # Author: ZhiCheng Zhang <zhangzhicheng@cnncmail.cn>
-# Date: 2025-07-30
+# Date: 2025-07-31
 
 import fcntl  # Linux/Unix系统的文件锁
 import tempfile
@@ -962,9 +962,63 @@ class RealTimePlotApp(QMainWindow):
         # 连接鼠标移动事件
         self.canvas.mpl_connect('motion_notify_event', self.on_hover)
 
+    # def on_hover(self, event):
+    #     """鼠标悬停事件处理"""
+    #     if not self.run_stat or event.inaxes != self.ax:
+    #         self.hover_annotation.set_visible(False)
+    #         self.canvas.draw_idle()
+    #         return
+        
+    #     # 获取鼠标位置
+    #     x_mouse = event.xdata
+    #     y_mouse = event.ydata
+        
+    #     if x_mouse is None or y_mouse is None:
+    #         self.hover_annotation.set_visible(False)
+    #         self.canvas.draw_idle()
+    #         return
+        
+    #     # 找到最接近的数据点
+    #     closest_point = self.find_closest_point(x_mouse, y_mouse)
+        
+    #     if closest_point:
+    #         channel, index, x_val, y_val, time_val = closest_point
+            
+    #         # 计算运行时间
+    #         if self.start_time and time_val > 0:
+    #             runtime = time_val - self.start_time
+    #             time_str = f"{runtime:.2f}s"
+    #         else:
+    #             time_str = "N/A"
+            
+    #         # 创建显示文本
+    #         hover_text = f"Channel {channel}\nTime: {time_str}\nCurrent: {y_val:.3f} mA"
+            
+    #         # 更新注释
+    #         self.hover_annotation.xy = (x_val, y_val)
+    #         self.hover_annotation.set_text(hover_text)
+    #         self.hover_annotation.set_visible(True)
+            
+    #         # 设置不同通道的颜色
+    #         if channel == 1:
+    #             self.hover_annotation.get_bbox_patch().set_facecolor('lightblue')
+    #         else:
+    #             self.hover_annotation.get_bbox_patch().set_facecolor('lightcoral')
+    #     else:
+    #         self.hover_annotation.set_visible(False)
+        
+    #     self.canvas.draw_idle()
+
     def on_hover(self, event):
         """鼠标悬停事件处理"""
-        if not self.run_stat or event.inaxes != self.ax:
+        # 只检查鼠标是否在图表区域内，不检查运行状态
+        if event.inaxes != self.ax:
+            self.hover_annotation.set_visible(False)
+            self.canvas.draw_idle()
+            return
+        
+        # 检查是否有有效数据（可选的额外检查）
+        if not hasattr(self, 'time_data') or len(self.time_data) == 0:
             self.hover_annotation.set_visible(False)
             self.canvas.draw_idle()
             return
@@ -1008,6 +1062,7 @@ class RealTimePlotApp(QMainWindow):
             self.hover_annotation.set_visible(False)
         
         self.canvas.draw_idle()
+
 
     def find_closest_point(self, x_mouse, y_mouse):
         """找到最接近鼠标位置的数据点"""
@@ -1125,101 +1180,33 @@ class RealTimePlotApp(QMainWindow):
         content_label.setAlignment(QtCore.Qt.AlignTop)
         content_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         
-        about_text = """
+        # 读取外部HTML文件
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        about_file = os.path.join(current_dir, 'about.html')
+        
+        try:
+            with open(about_file, 'r', encoding='utf-8') as f:
+                about_text = f.read()
+        except FileNotFoundError:
+            about_text = """
             <div style="font-family: Arial, sans-serif; line-height: 1.6;">
             <center>
-            <h2 style="color: #2E86AB; margin-bottom: 10px;">Real-Time Current Monitoring System - Dual Channel</h2>
-            <p><b>Version 2025.07.30</b></p>
-            <p>Compatible with 創鴻高精度智能盤面表 DM4D-An-Rs</p>
-            <p><b>Developer:</b> Zhicheng Zhang</p>
-            <p><b>Email:</b> <a href="mailto:zhangzhicheng@cnncmail.cn">zhangzhicheng@cnncmail.cn</a></p>
-            <p><b>Special Thanks:</b> Dr. Taoyu Jiao</p>
-            <p style="color: #666; font-size: 12px;">© 2025 CIAE & IMP Nuclear Astrophysics Group. All Rights Reserved.</p>
+            <h2 style="color: #2E86AB;">Real-Time Current Monitoring System - Dual Channel</h2>
+            <p><b>Error:</b> about.html file not found</p>
+            <p>Please ensure the about.html file is in the same directory as the main program.</p>
             </center>
-            
-            <hr style="margin: 20px 0; border: 1px solid #ddd;">
-            
-            <h3 style="color: #2E86AB;">About This Software</h3>
-            <p>This software is designed for real-time monitoring of dual-channel current data and charge integral calculation, supporting automatic data saving and graphical visualization.</p>
-            <p>Tested and verified on Ubuntu 24.04 LTS with Anaconda 25.5.1</p>
-          
-            <hr style="margin: 20px 0; border: 1px solid #ddd;">
-            
-            <h3 style="color: #2E86AB;">Update History</h3>
-            
-            <div style="margin-left: 15px;">
-            <h4 style=\"color: #4A90E2; margin-bottom: 5px;\"> 2025-07-30 (Latest)</h4>
-            <ul style=\"margin-top: 5px; margin-bottom: 15px;\">
-                <li>Fixed integral calculation precision issue where integration would stop increasing after reaching 1000 mC.</li>
-            </ul>
-
-            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-07-28</h4>
-            <ul style="margin-top: 5px; margin-bottom: 15px;">
-                <li>An intelligent pulse reminder system was added, and its toggle switch is located in the Run menu.</li>
-                <li>Added interactive data point hover functionality to the real-time plot.</li>
-            </ul>
-
-            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-07-27</h4>
-            <ul style="margin-top: 5px; margin-bottom: 15px;">
-                <li>Enhanced file naming system with automatic numbering.</li>
-                <li>Auto-increment filename when stopping monitoring.</li>
-            </ul>
-
-            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-07-16</h4>
-            <ul style="margin-top: 5px; margin-bottom: 15px;">
-                <li>Added dual-channel monitoring support.</li>
-                <li>Enhanced plotting with two current curves.</li>
-                <li>Updated data saving format for dual channels.</li>
-                <li>Improved UI layout for better dual-channel display.</li>
-            </ul>
-            
-            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-07-03</h4>
-            <ul style="margin-top: 5px; margin-bottom: 15px;">
-                <li>Fixed the issue where the storage directory could not be opened when using the default file.</li>
-                <li>Fixed the issue where appending to storage did not start a new line.</li>
-                <li>Set the maximum value of the current plotting area to 30mA.</li>
-                <li>Optimized some details when saving files.</li>
-            </ul>
-
-            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-06-30</h4>
-            <ul style="margin-top: 5px; margin-bottom: 15px;">
-                <li>Change the software interface language to English.</li>
-            </ul>
-            
-            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-06-28</h4>
-            <ul style="margin-top: 5px; margin-bottom: 15px;">
-                <li>Added a user guide.</li>
-            </ul>
-            
-            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-06-25</h4>
-            <ul style="margin-top: 5px; margin-bottom: 15px;">
-                <li>Added file locking functionality.</li>
-                <li>Added the ability to customize the communication interval for the ammeter.</li>
-                <li>Rearranged the interface layout.</li>
-            </ul>
-            
-            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-06-20</h4>
-            <ul style="margin-top: 5px; margin-bottom: 15px;">
-                <li>Added serial port detection functionality.</li>
-                <li>Added the ability to save snapshots.</li>
-            </ul>
-            
-            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-06-16</h4>
-            <ul style="margin-top: 5px; margin-bottom: 15px;">
-                <li>Initial Release.</li>
-            </ul>
             </div>
-            
-            <hr style="margin: 20px 0; border: 1px solid #ddd;">
-            
+            """
+        except Exception as e:
+            about_text = f"""
+            <div style="font-family: Arial, sans-serif; line-height: 1.6;">
             <center>
-            <p style="font-size: 12px; color: #888;">
-            For technical support or bug reports, please contact the developer.<br>
-            This software is provided "as is" without warranty of any kind.
-            </p>
+            <h2 style="color: #2E86AB;">Real-Time Current Monitoring System - Dual Channel</h2>
+            <p><b>Error:</b> Failed to load about.html</p>
+            <p>Error details: {str(e)}</p>
             </center>
             </div>
-        """
+            """
         
         content_label.setText(about_text)
         
@@ -1249,6 +1236,7 @@ class RealTimePlotApp(QMainWindow):
         
         # 显示对话框
         about_dialog.exec_()
+
 
     def show_tutorial(self):
         """显示教程对话框"""
