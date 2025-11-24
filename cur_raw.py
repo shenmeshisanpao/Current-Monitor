@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Real-time Dual-Channel Current Monitor with PyQt5 and Auto-Save
 # Author: ZhiCheng Zhang <zhangzhicheng@cnncmail.cn>
-# Date: 2025-07-31
+# Date: 2025-11-24
 
 import fcntl  # Linux/Unix系统的文件锁
 import tempfile
@@ -28,7 +28,7 @@ from matplotlib.figure import Figure
 from matplotlib import rcParams
 
 # 设置高精度计算
-getcontext().prec = 15  # 设置Decimal精度为15位小数
+getcontext().prec = 5  # 设置Decimal精度为5位小数
 
 # 设置Matplotlib参数
 rcParams['font.size'] = 8
@@ -149,6 +149,9 @@ class RealTimePlotApp(QMainWindow):
         self.serialport2.stopbits = 1
         self.serialport2.timeout = 0.1
         
+        # 初始化单表模式标志
+        self.single_channel_mode = False 
+
         # 初始化变量
         self.run_stat = False
         self.column_int1 = Decimal('0.0')  # 通道1电荷量
@@ -166,17 +169,7 @@ class RealTimePlotApp(QMainWindow):
         self.filename = "Run_0000.csv"  # 默认文件名
         self.file_mode = "append"  # 默认文件模式：追加
         self.update_interval = 100  # 默认更新间隔100ms
-
-        # 脉冲提醒相关变量
-        self.pulse_reminder_enabled = True  # 脉冲提醒开关，默认开启
-        self.pulse_reminder_timer = QTimer()  # 脉冲提醒定时器
-        self.pulse_reminder_timer.timeout.connect(self.show_pulse_reminder)
-        self.pulse_reminder_timer.setSingleShot(True)  # 单次触发
-        self.reminder_suppressed = False  # 本轮是否已抑制提醒
-
-        # 鼠标悬停相关属性
-        self.hover_annotation = None       
-
+        
         # 然后创建UI和菜单栏
         self.init_ui()
         self.create_menu_bar()
@@ -190,7 +183,7 @@ class RealTimePlotApp(QMainWindow):
         """创建菜单栏"""
         menu_bar = self.menuBar()
         
-        # 文件菜单
+        # 1.[文件菜单]
         file_menu = menu_bar.addMenu('File')
         
         # 添加创建快照菜单项
@@ -212,7 +205,7 @@ class RealTimePlotApp(QMainWindow):
         exit_action.setShortcut('Ctrl+Q')
         file_menu.addAction(exit_action)
         
-        # 运行菜单
+        # 2.[运行菜单]
         run_menu = menu_bar.addMenu('Run')
         
         # 开始监控菜单项
@@ -230,16 +223,6 @@ class RealTimePlotApp(QMainWindow):
 
         run_menu.addSeparator()
 
-        # 脉冲提醒开关菜单项
-        self.pulse_reminder_action = QtWidgets.QAction('Pulse Reminder', self)
-        self.pulse_reminder_action.setCheckable(True)
-        self.pulse_reminder_action.setChecked(True)  # 默认开启
-        self.pulse_reminder_action.triggered.connect(self.toggle_pulse_reminder)
-        self.pulse_reminder_action.setToolTip("Enable/Disable Pulse Reminder")
-        run_menu.addAction(self.pulse_reminder_action)
-
-        run_menu.addSeparator()
-
         # 更新间隔设置菜单项
         update_interval_action = QtWidgets.QAction('Set Update Interval', self)
         update_interval_action.triggered.connect(self.set_update_interval)
@@ -247,7 +230,18 @@ class RealTimePlotApp(QMainWindow):
         update_interval_action.setToolTip("Set Data Update Interval")
         run_menu.addAction(update_interval_action)
 
-        # 帮助菜单
+        # 3.[设置菜单]
+        settings_menu = menu_bar.addMenu('Settings')
+        
+        # 单表模式切换动作
+        self.single_mode_action = QtWidgets.QAction('Single Channel Mode (Ch1 Only)', self)
+        self.single_mode_action.setCheckable(True)  # 设置为可勾选
+        self.single_mode_action.setChecked(False)   # 默认不勾选
+        self.single_mode_action.triggered.connect(self.toggle_single_mode)
+        self.single_mode_action.setToolTip("Enable monitoring with only Channel 1 connected")
+        settings_menu.addAction(self.single_mode_action)        
+
+        # 4.[帮助菜单]
         help_menu = menu_bar.addMenu('Help')
         
         # 教程菜单项
@@ -404,9 +398,6 @@ class RealTimePlotApp(QMainWindow):
         self.ax.set_ylim(0, 10)
         self.ax.legend()  # 显示图例
         self.ax.grid(True, alpha=0.3)
-
-        # 鼠标悬停功能
-        self.setup_mouse_hover()
         
         # 添加到主布局
         main_layout.addLayout(serial_layout)
@@ -703,28 +694,61 @@ class RealTimePlotApp(QMainWindow):
         """获取当前时间戳"""
         return time.time()
     
+    # 处理单表模式切换
+    def toggle_single_mode(self, state):
+        """切换单表/双表模式"""
+        if self.run_stat:
+            QMessageBox.warning(self, "Warning", "Cannot change mode while monitoring is running!")
+            self.single_mode_action.setChecked(not state) # 恢复原状
+            return
+
+        self.single_channel_mode = state
+        
+        # 视觉反馈：如果开启单表模式，禁用通道2的输入框和按钮
+        self.port2_input.setEnabled(not state)
+        self.test_serial2_button.setEnabled(not state)
+        
+        if state:
+            self.current2_label.setText("Channel 2 Current: --- (Disabled)")
+            self.current2_label.setStyleSheet("font-size: 14px; font-weight: bold; color: gray;")
+        else:
+            self.current2_label.setText("Channel 2 Current: --- mA")
+            self.current2_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #ff7f0e;")
+            
+        print(f"Single Channel Mode set to: {self.single_channel_mode}")
+
+    
     def start_monitoring(self):
         """开始监控"""
         # 获取串口名
         port1 = self.port1_input.text().strip()
         port2 = self.port2_input.text().strip()
         
-        if not port1 or not port2:
-            QMessageBox.warning(self, "Warning", "Please Enter Both Serial Port Names!")
+        # 检查串口名逻辑
+        if not port1:
+            QMessageBox.warning(self, "Warning", "Please Enter Channel 1 Serial Port Name!")
+            return
+
+        # 只有在非单表模式下才检查串口2
+        if not self.single_channel_mode and not port2:
+            QMessageBox.warning(self, "Warning", "Please Enter Channel 2 Serial Port Name!")
             return
             
         self.serialport1.port = port1
         self.serialport2.port = port2
         
         try:
-            # 打开两个串口
+            # 打开串口
             if self.serialport1.is_open:
                 self.serialport1.close()
-            if self.serialport2.is_open:
-                self.serialport2.close()
+            self.serialport1.open() # 始终打开串口1
+            
+            # === [修改] 只有在非单表模式下才打开串口2 ===
+            if not self.single_channel_mode:
+                if self.serialport2.is_open:
+                    self.serialport2.close()
+                self.serialport2.open()
                 
-            self.serialport1.open()
-            self.serialport2.open()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to Open Serial Ports: {e}")
             return
@@ -733,7 +757,8 @@ class RealTimePlotApp(QMainWindow):
         if not self.open_data_file():
             QMessageBox.critical(self, "Error", "Cannot Open Data File, Monitoring Cannot Start!")
             return
-        
+
+        self.single_mode_action.setEnabled(False)        # 运行时禁用模式切换   
         self.run_stat = True
         # 更新菜单状态
         self.start_action.setEnabled(False)  
@@ -751,14 +776,7 @@ class RealTimePlotApp(QMainWindow):
         
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-
-        # 重置提醒抑制状态
-        self.reminder_suppressed = False
-
-        # 如果脉冲提醒功能开启，启动10秒后的提醒定时器
-        if self.pulse_reminder_enabled:
-            self.pulse_reminder_timer.start(10 * 1000)  # 10秒后提醒
-                        
+        
         print("Monitoring Started")
     
     def stop_monitoring(self):
@@ -767,16 +785,13 @@ class RealTimePlotApp(QMainWindow):
         # 更新菜单状态
         self.start_action.setEnabled(True)   
         self.stop_action.setEnabled(False)   
+        self.single_mode_action.setEnabled(True)    # 恢复模式切换菜单可用
 
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         
         # 关闭数据文件
         self.close_data_file()
-
-        # 停止脉冲提醒定时器
-        if self.pulse_reminder_timer.isActive():
-            self.pulse_reminder_timer.stop()
         
         # 关闭串口
         if self.serialport1.is_open:
@@ -786,7 +801,7 @@ class RealTimePlotApp(QMainWindow):
             except Exception as e:
                 print(f"Failed to Close Serial Port 1: {e}")
                 
-        if self.serialport2.is_open:
+        if not self.single_channel_mode and self.serialport2.is_open:
             try:
                 self.serialport2.close()
                 print("Serial Port 2 Closed")
@@ -876,238 +891,6 @@ class RealTimePlotApp(QMainWindow):
             
             print(f"Update interval changed to: {interval}ms")
 
-    def toggle_pulse_reminder(self):
-        """切换脉冲提醒开关"""
-        self.pulse_reminder_enabled = self.pulse_reminder_action.isChecked()
-        status = "enabled" if self.pulse_reminder_enabled else "disabled"
-        print(f"Pulse reminder {status}")
-        
-        # 如果关闭提醒且定时器正在运行，停止定时器
-        if not self.pulse_reminder_enabled and self.pulse_reminder_timer.isActive():
-            self.pulse_reminder_timer.stop()
-
-    def show_pulse_reminder(self):
-        """显示脉冲提醒对话框"""
-        if not self.pulse_reminder_enabled or self.reminder_suppressed:
-            return
-        
-        # 创建自定义对话框
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Pulse Reminder")
-        dialog.setFixedSize(300, 150)
-        dialog.setModal(True)
-        
-        # 设置对话框图标
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
-        if os.path.exists(icon_path):
-            dialog.setWindowIcon(QtGui.QIcon(icon_path))
-        
-        layout = QVBoxLayout()
-        
-        # 提醒文本
-        message_label = QLabel("Reminder: Please apply pulse")
-        message_label.setAlignment(QtCore.Qt.AlignCenter)
-        message_label.setStyleSheet("font-size: 14px; font-weight: bold; margin: 10px;")
-        layout.addWidget(message_label)
-        
-        # 按钮布局
-        button_layout = QHBoxLayout()
-        
-        # "本轮内不再提醒"按钮
-        no_more_button = QPushButton("No More in This Run")
-        no_more_button.clicked.connect(lambda: self.handle_reminder_choice(dialog, "no_more"))
-        no_more_button.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 8px;")
-        
-        # "5分钟后再次提醒"按钮
-        remind_later_button = QPushButton("Remind in 5 Minutes")
-        remind_later_button.clicked.connect(lambda: self.handle_reminder_choice(dialog, "remind_later"))
-        remind_later_button.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 8px;")
-        
-        button_layout.addWidget(no_more_button)
-        button_layout.addWidget(remind_later_button)
-        
-        layout.addLayout(button_layout)
-        dialog.setLayout(layout)
-        
-        # 显示对话框
-        dialog.exec_()
-
-    def handle_reminder_choice(self, dialog, choice):
-        """处理用户的提醒选择"""
-        dialog.accept()  # 关闭对话框
-        
-        if choice == "no_more":
-            # 本轮内不再提醒
-            self.reminder_suppressed = True
-            print("Pulse reminder suppressed for this monitoring session")
-        elif choice == "remind_later":
-            # 5分钟后再次提醒
-            self.pulse_reminder_timer.start(5 * 60 * 1000)  # 5分钟 = 300000毫秒
-            print("Pulse reminder will show again in 5 minutes")
-
-    def setup_mouse_hover(self):
-        """设置鼠标悬停功能"""
-        # 创建注释文本框
-        self.hover_annotation = self.ax.annotate(
-            '', 
-            xy=(0, 0), 
-            xytext=(20, 20), 
-            textcoords="offset points",
-            bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.8),
-            arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0"),
-            fontsize=10,
-            visible=False
-        )
-        
-        # 连接鼠标移动事件
-        self.canvas.mpl_connect('motion_notify_event', self.on_hover)
-
-    # def on_hover(self, event):
-    #     """鼠标悬停事件处理"""
-    #     if not self.run_stat or event.inaxes != self.ax:
-    #         self.hover_annotation.set_visible(False)
-    #         self.canvas.draw_idle()
-    #         return
-        
-    #     # 获取鼠标位置
-    #     x_mouse = event.xdata
-    #     y_mouse = event.ydata
-        
-    #     if x_mouse is None or y_mouse is None:
-    #         self.hover_annotation.set_visible(False)
-    #         self.canvas.draw_idle()
-    #         return
-        
-    #     # 找到最接近的数据点
-    #     closest_point = self.find_closest_point(x_mouse, y_mouse)
-        
-    #     if closest_point:
-    #         channel, index, x_val, y_val, time_val = closest_point
-            
-    #         # 计算运行时间
-    #         if self.start_time and time_val > 0:
-    #             runtime = time_val - self.start_time
-    #             time_str = f"{runtime:.2f}s"
-    #         else:
-    #             time_str = "N/A"
-            
-    #         # 创建显示文本
-    #         hover_text = f"Channel {channel}\nTime: {time_str}\nCurrent: {y_val:.3f} mA"
-            
-    #         # 更新注释
-    #         self.hover_annotation.xy = (x_val, y_val)
-    #         self.hover_annotation.set_text(hover_text)
-    #         self.hover_annotation.set_visible(True)
-            
-    #         # 设置不同通道的颜色
-    #         if channel == 1:
-    #             self.hover_annotation.get_bbox_patch().set_facecolor('lightblue')
-    #         else:
-    #             self.hover_annotation.get_bbox_patch().set_facecolor('lightcoral')
-    #     else:
-    #         self.hover_annotation.set_visible(False)
-        
-    #     self.canvas.draw_idle()
-
-    def on_hover(self, event):
-        """鼠标悬停事件处理"""
-        # 只检查鼠标是否在图表区域内，不检查运行状态
-        if event.inaxes != self.ax:
-            self.hover_annotation.set_visible(False)
-            self.canvas.draw_idle()
-            return
-        
-        # 检查是否有有效数据（可选的额外检查）
-        if not hasattr(self, 'time_data') or len(self.time_data) == 0:
-            self.hover_annotation.set_visible(False)
-            self.canvas.draw_idle()
-            return
-        
-        # 获取鼠标位置
-        x_mouse = event.xdata
-        y_mouse = event.ydata
-        
-        if x_mouse is None or y_mouse is None:
-            self.hover_annotation.set_visible(False)
-            self.canvas.draw_idle()
-            return
-        
-        # 找到最接近的数据点
-        closest_point = self.find_closest_point(x_mouse, y_mouse)
-        
-        if closest_point:
-            channel, index, x_val, y_val, time_val = closest_point
-            
-            # 计算运行时间
-            if self.start_time and time_val > 0:
-                runtime = time_val - self.start_time
-                time_str = f"{runtime:.2f}s"
-            else:
-                time_str = "N/A"
-            
-            # 创建显示文本
-            hover_text = f"Channel {channel}\nTime: {time_str}\nCurrent: {y_val:.3f} mA"
-            
-            # 更新注释
-            self.hover_annotation.xy = (x_val, y_val)
-            self.hover_annotation.set_text(hover_text)
-            self.hover_annotation.set_visible(True)
-            
-            # 设置不同通道的颜色
-            if channel == 1:
-                self.hover_annotation.get_bbox_patch().set_facecolor('lightblue')
-            else:
-                self.hover_annotation.get_bbox_patch().set_facecolor('lightcoral')
-        else:
-            self.hover_annotation.set_visible(False)
-        
-        self.canvas.draw_idle()
-
-
-    def find_closest_point(self, x_mouse, y_mouse):
-        """找到最接近鼠标位置的数据点"""
-        min_distance = float('inf')
-        closest_point = None
-        
-        # 检查通道1的数据点
-        for i in range(len(self.x_data)):
-            x_data_point = self.x_data[i]
-            y_data_point = self.y_data1[i]
-            
-            # 计算距离（考虑坐标轴的比例）
-            x_range = self.ax.get_xlim()[1] - self.ax.get_xlim()[0]
-            y_range = self.ax.get_ylim()[1] - self.ax.get_ylim()[0]
-            
-            # 归一化距离计算
-            dx = (x_mouse - x_data_point) / x_range
-            dy = (y_mouse - y_data_point) / y_range
-            distance = (dx**2 + dy**2)**0.5
-            
-            if distance < min_distance and distance < 0.05:  # 设置敏感度阈值
-                min_distance = distance
-                time_val = self.time_data[i] if hasattr(self, 'time_data') and i < len(self.time_data) else 0
-                closest_point = (1, i, x_data_point, y_data_point, time_val)
-        
-        # 检查通道2的数据点
-        for i in range(len(self.x_data)):
-            x_data_point = self.x_data[i]
-            y_data_point = self.y_data2[i]
-            
-            # 计算距离
-            x_range = self.ax.get_xlim()[1] - self.ax.get_xlim()[0]
-            y_range = self.ax.get_ylim()[1] - self.ax.get_ylim()[0]
-            
-            dx = (x_mouse - x_data_point) / x_range
-            dy = (y_mouse - y_data_point) / y_range
-            distance = (dx**2 + dy**2)**0.5
-            
-            if distance < min_distance and distance < 0.05:
-                min_distance = distance
-                time_val = self.time_data[i] if hasattr(self, 'time_data') and i < len(self.time_data) else 0
-                closest_point = (2, i, x_data_point, y_data_point, time_val)
-        
-        return closest_point
-
     def show_about(self):
         """显示关于对话框"""
         about_dialog = QDialog(self)
@@ -1180,33 +963,97 @@ class RealTimePlotApp(QMainWindow):
         content_label.setAlignment(QtCore.Qt.AlignTop)
         content_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         
-        # 读取外部HTML文件
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        about_file = os.path.join(current_dir, 'about.html')
-        
-        try:
-            with open(about_file, 'r', encoding='utf-8') as f:
-                about_text = f.read()
-        except FileNotFoundError:
-            about_text = """
+        about_text = """
             <div style="font-family: Arial, sans-serif; line-height: 1.6;">
             <center>
-            <h2 style="color: #2E86AB;">Real-Time Current Monitoring System - Dual Channel</h2>
-            <p><b>Error:</b> about.html file not found</p>
-            <p>Please ensure the about.html file is in the same directory as the main program.</p>
+            <h2 style="color: #2E86AB; margin-bottom: 10px;">Real-Time Current Monitoring System - Dual Channel</h2>
+            <p><b>Version 2025.11.24</b></p>
+            <p>Compatible with 創鴻高精度智能盤面表 DM4D-An-Rs</p>
+            <p><b>Developer:</b> Zhicheng Zhang</p>
+            <p><b>Email:</b> <a href="mailto:zhangzhicheng@cnncmail.cn">zhangzhicheng@cnncmail.cn</a></p>
+            <p><b>Special Thanks:</b> Dr. Taoyu Jiao</p>
+            <p style="color: #666; font-size: 12px;">© 2025 CIAE Nuclear Astrophysics Group. All Rights Reserved.</p>
             </center>
+            
+            <hr style="margin: 20px 0; border: 1px solid #ddd;">
+            
+            <h3 style="color: #2E86AB;">About This Software</h3>
+            <p>This software is designed for real-time monitoring of dual-channel current data and charge integral calculation. It supports automatic data saving, graphical visualization, and <b>flexible Single/Dual channel operation modes</b>.</p>
+            <p>Tested and verified on Ubuntu 24.04 LTS with Anaconda 25.5.1</p>
+          
+            <hr style="margin: 20px 0; border: 1px solid #ddd;">
+            
+            <h3 style="color: #2E86AB;">Update History</h3>
+            
+            <div style="margin-left: 15px;">
+            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-11-24 (Latest)</h4>
+            <ul style="margin-top: 5px; margin-bottom: 15px;">
+                <li><b>New Feature:</b> Added "Single Channel Mode" in Settings menu.</li>
+                <li>Allows monitoring with only Channel 1 connected (skips Ch2 serial check).</li>
+                <li>In Single Mode: Ch2 plotting is hidden, and data is recorded as 0.</li>
+            </ul>
+
+            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-07-27</h4>
+            <ul style="margin-top: 5px; margin-bottom: 15px;">
+                <li>Enhanced file naming system with automatic numbering.</li>
+                <li>Auto-increment filename when stopping monitoring.</li>
+            </ul>
+
+            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-07-16</h4>
+            <ul style="margin-top: 5px; margin-bottom: 15px;">
+                <li>Added dual-channel monitoring support.</li>
+                <li>Enhanced plotting with two current curves.</li>
+                <li>Updated data saving format for dual channels.</li>
+                <li>Improved UI layout for better dual-channel display.</li>
+            </ul>
+            
+            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-07-03</h4>
+            <ul style="margin-top: 5px; margin-bottom: 15px;">
+                <li>Fixed the issue where the storage directory could not be opened when using the default file.</li>
+                <li>Fixed the issue where appending to storage did not start a new line.</li>
+                <li>Set the maximum value of the current plotting area to 30mA.</li>
+                <li>Optimized some details when saving files.</li>
+            </ul>
+
+            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-06-30</h4>
+            <ul style="margin-top: 5px; margin-bottom: 15px;">
+                <li>Change the software interface language to English.</li>
+            </ul>
+            
+            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-06-28</h4>
+            <ul style="margin-top: 5px; margin-bottom: 15px;">
+                <li>Added a user guide.</li>
+            </ul>
+            
+            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-06-25</h4>
+            <ul style="margin-top: 5px; margin-bottom: 15px;">
+                <li>Added file locking functionality.</li>
+                <li>Added the ability to customize the communication interval for the ammeter.</li>
+                <li>Rearranged the interface layout.</li>
+            </ul>
+            
+            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-06-20</h4>
+            <ul style="margin-top: 5px; margin-bottom: 15px;">
+                <li>Added serial port detection functionality.</li>
+                <li>Added the ability to save snapshots.</li>
+            </ul>
+            
+            <h4 style="color: #4A90E2; margin-bottom: 5px;"> 2025-06-16</h4>
+            <ul style="margin-top: 5px; margin-bottom: 15px;">
+                <li>Initial Release.</li>
+            </ul>
             </div>
-            """
-        except Exception as e:
-            about_text = f"""
-            <div style="font-family: Arial, sans-serif; line-height: 1.6;">
+            
+            <hr style="margin: 20px 0; border: 1px solid #ddd;">
+            
             <center>
-            <h2 style="color: #2E86AB;">Real-Time Current Monitoring System - Dual Channel</h2>
-            <p><b>Error:</b> Failed to load about.html</p>
-            <p>Error details: {str(e)}</p>
+            <p style="font-size: 12px; color: #888;">
+            For technical support or bug reports, please contact the developer.<br>
+            This software is provided "as is" without warranty of any kind.
+            </p>
             </center>
             </div>
-            """
+        """
         
         content_label.setText(about_text)
         
@@ -1236,7 +1083,6 @@ class RealTimePlotApp(QMainWindow):
         
         # 显示对话框
         about_dialog.exec_()
-
 
     def show_tutorial(self):
         """显示教程对话框"""
@@ -1274,25 +1120,30 @@ class RealTimePlotApp(QMainWindow):
         event.accept()
     
     def update_data(self):
-        """定时更新数据 - 双通道版本"""
+        """定时更新数据 - 支持单/双通道"""
         if not self.run_stat:
             return
         
         try:
-            # 发送请求到两个通道
+            # 发送请求
             self.send_data(1)
-            self.send_data(2)
+            if not self.single_channel_mode:
+                self.send_data(2)
             
-            # 接收两个通道的数据
+            # 接收数据
             current1 = self.recv_data(1)
-            current2 = self.recv_data(2)
+            
+            if not self.single_channel_mode:
+                current2 = self.recv_data(2)
+            else:
+                # 单表模式下，强制电流为0
+                current2 = 0.0
             
             # 检查数据有效性
-            if current1 is None or current2 is None:
+            if current1 is None or (not self.single_channel_mode and current2 is None):
                 return
             
-            # 检查电流值是否有效
-            # if current1 < 0 or current1 > 1000 or current2 < 0 or current2 > 1000:
+            # 检查电流值是否有效 (单表模式下 current2 是 0，不会触发 > 1000)
             if current1 > 1000 or current2 > 1000:
                 print(f"Invalid Current Values: Ch1={current1} mA, Ch2={current2} mA, Skipping Calculation")
                 return
@@ -1308,7 +1159,7 @@ class RealTimePlotApp(QMainWindow):
             local_time_str = time.strftime("%Y-%m-%d %H:%M:%S (UTC%z)", local_time)
             utc_time_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", utc_time)
             
-            # 优化积分计算：使用梯形法则 - 双通道
+            # 优化积分计算：使用梯形法则
             if self.last_time is not None:
                 delta_t = now - self.last_time
                 
@@ -1326,7 +1177,7 @@ class RealTimePlotApp(QMainWindow):
                     charge_segment1 = Decimal(str(current1)) * Decimal(str(delta_t))
                     self.column_int1 += charge_segment1
                 
-                # 通道2积分计算
+                # 通道2积分计算 (单表模式下 current2 为 0，积分增加量为 0，保持不变)
                 if self.last_current2 is not None:
                     avg_current2 = Decimal(str((self.last_current2 + current2) / 2.0))
                     charge_segment2 = avg_current2 * Decimal(str(delta_t))
@@ -1351,26 +1202,38 @@ class RealTimePlotApp(QMainWindow):
             integral2_float = float(self.column_int2)
             
             self.current1_label.setText(f"Channel 1 Current: {current1:.3f} mA")
-            self.current2_label.setText(f"Channel 2 Current: {current2:.3f} mA")
+            
+            # 标签显示
+            if not self.single_channel_mode:
+                self.current2_label.setText(f"Channel 2 Current: {current2:.3f} mA")
+            else:
+                self.current2_label.setText("Channel 2 Current: ---")
+                
             self.runtime_label.setText(f"Run Time: {h:02d} Hours {m:02d} Minutes {s:05.2f} Seconds")
             self.integral1_label.setText(f"Channel 1 Integral: {integral1_float:.3f} mC")
             self.integral2_label.setText(f"Channel 2 Integral: {integral2_float:.3f} mC")
             self.timestamp_label.setText(f"Last Update Time (Local): {local_time_str}")
             self.utc_timestamp_label.setText(f"UTC Timestamp: {utc_time_str}")
             
-            # 更新绘图数据 - 双通道
+            # 更新绘图数据
             self.y_data1 = np.roll(self.y_data1, -1)
             self.y_data1[-1] = current1
             
             self.y_data2 = np.roll(self.y_data2, -1)
-            self.y_data2[-1] = current2
+            self.y_data2[-1] = current2 # 单表模式下存入0
             
             self.time_data = np.roll(self.time_data, -1)
             self.time_data[-1] = now
             
             # 更新曲线
             self.line1.set_ydata(self.y_data1)
-            self.line2.set_ydata(self.y_data2)
+            
+            # 曲线显示控制
+            if not self.single_channel_mode:
+                self.line2.set_visible(True)
+                self.line2.set_ydata(self.y_data2)
+            else:
+                self.line2.set_visible(False) # 单表模式隐藏曲线
             
             # 更新X轴标签为运行时间
             x_labels = []
@@ -1379,12 +1242,16 @@ class RealTimePlotApp(QMainWindow):
                 x_labels.append(f"{time_sec:.1f}")
             
             # 设置X轴刻度为运行时间
-            tick_indices = range(0, self.data_points, max(1, self.data_points//10))
-            self.ax.set_xticks(tick_indices)
-            self.ax.set_xticklabels([x_labels[i] for i in tick_indices])
+            self.ax.set_xticks(range(0, self.data_points, self.data_points//10))
+            self.ax.set_xticklabels([x_labels[i] for i in range(0, self.data_points, self.data_points//10)])
             
-            # 自动调整Y轴范围 - 考虑两个通道的数据
-            all_data = np.concatenate([self.y_data1, self.y_data2])
+            # 自动调整Y轴范围
+            # 自动缩放只考虑通道1 (如果是单表模式) 
+            if self.single_channel_mode:
+                all_data = self.y_data1
+            else:
+                all_data = np.concatenate([self.y_data1, self.y_data2])
+                
             min_val = max(-1, min(all_data) - 0.1)
             max_val = min(10, max(all_data) + 0.1)  # 上限设为10mA
             self.ax.set_ylim(min_val, max_val)
@@ -1392,15 +1259,16 @@ class RealTimePlotApp(QMainWindow):
             # 重绘图形
             self.canvas.draw()
             
-            # 写入数据到文件 - 双通道
+            # 写入数据到文件 (current2 已经是 0.0，会自动写入)
             self.write_data_row(now, runtime, current1, current2, integral1_float, integral2_float)
             
-            # 打印到控制台 - 双通道
+            # 打印到控制台
             print(f"Ch1: {current1:.3f} mA, Ch2: {current2:.3f} mA, Runtime: {runtime:.3f} s, "
                   f"Int1: {integral1_float:.3f} mC, Int2: {integral2_float:.3f} mC, UTC: {utc_time_str}")
             
         except Exception as e:
             print(f"Error Updating Data: {e}")
+
 
 def main():
     app = QApplication(sys.argv)
@@ -1423,4 +1291,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
