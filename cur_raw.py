@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Real-time Dual-Channel Current Monitor with PyQt5 and Auto-Save
 # Author: ZhiCheng Zhang <zhangzhicheng@cnncmail.cn>
-# Date: 2025-07-31
+# Date: 2025-11-24
 
 import fcntl  # Linux/Unix系统的文件锁
 import tempfile
@@ -166,6 +166,7 @@ class RealTimePlotApp(QMainWindow):
         self.filename = "Run_0000.csv"  # 默认文件名
         self.file_mode = "append"  # 默认文件模式：追加
         self.update_interval = 100  # 默认更新间隔100ms
+        self.single_channel_mode = False # 默认为双通道模式
 
         # 脉冲提醒相关变量
         self.pulse_reminder_enabled = True  # 脉冲提醒开关，默认开启
@@ -230,6 +231,16 @@ class RealTimePlotApp(QMainWindow):
 
         run_menu.addSeparator()
 
+        # 单通道模式开关菜单项
+        self.single_mode_action = QtWidgets.QAction('Single Channel Mode (CH1 Only)', self)
+        self.single_mode_action.setCheckable(True)
+        self.single_mode_action.setChecked(False)
+        self.single_mode_action.triggered.connect(self.toggle_single_mode)
+        self.single_mode_action.setToolTip("Enable to monitor only Channel 1. Cannot be changed while running.")
+        run_menu.addAction(self.single_mode_action)
+
+        run_menu.addSeparator()
+
         # 脉冲提醒开关菜单项
         self.pulse_reminder_action = QtWidgets.QAction('Pulse Reminder', self)
         self.pulse_reminder_action.setCheckable(True)
@@ -241,11 +252,12 @@ class RealTimePlotApp(QMainWindow):
         run_menu.addSeparator()
 
         # 更新间隔设置菜单项
-        update_interval_action = QtWidgets.QAction('Set Update Interval', self)
-        update_interval_action.triggered.connect(self.set_update_interval)
-        update_interval_action.setShortcut('Ctrl+I')
-        update_interval_action.setToolTip("Set Data Update Interval")
-        run_menu.addAction(update_interval_action)
+        self.update_interval_action = QtWidgets.QAction('Set Update Interval', self)
+        self.update_interval_action.triggered.connect(self.set_update_interval)
+        self.update_interval_action.setShortcut('Ctrl+I')
+        self.update_interval_action.setToolTip("Set Data Update Interval")
+        run_menu.addAction(self.update_interval_action)
+
 
         # 帮助菜单
         help_menu = menu_bar.addMenu('Help')
@@ -261,6 +273,25 @@ class RealTimePlotApp(QMainWindow):
         about_action.triggered.connect(self.show_about)
         about_action.setShortcut('Ctrl+A')
         help_menu.addAction(about_action)
+
+    def toggle_single_mode(self):
+        """切换单通道/双通道模式"""
+        self.single_channel_mode = self.single_mode_action.isChecked()
+        
+        # 视觉反馈：禁用/启用通道2的输入框和测试按钮
+        is_dual = not self.single_channel_mode
+        self.port2_input.setEnabled(is_dual)
+        self.test_serial2_button.setEnabled(is_dual)
+        
+        # 更新标签提示
+        if self.single_channel_mode:
+            self.current2_label.setText("Channel 2 Current: --- (Disabled)")
+            self.current2_label.setStyleSheet("font-size: 14px; font-weight: bold; color: gray;")
+        else:
+            self.current2_label.setText("Channel 2 Current: --- mA")
+            self.current2_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #ff7f0e;")
+            
+        print(f"Mode Switched: {'Single Channel' if self.single_channel_mode else 'Dual Channel'}")
 
     def init_ui(self):
         # 主布局
@@ -709,22 +740,31 @@ class RealTimePlotApp(QMainWindow):
         port1 = self.port1_input.text().strip()
         port2 = self.port2_input.text().strip()
         
-        if not port1 or not port2:
-            QMessageBox.warning(self, "Warning", "Please Enter Both Serial Port Names!")
+        # 检查串口名输入
+        if not port1:
+            QMessageBox.warning(self, "Warning", "Please Enter Channel 1 Serial Port Name!")
+            return
+
+        # 只有在双通道模式下才检查端口2
+        if not self.single_channel_mode and not port2:
+            QMessageBox.warning(self, "Warning", "Please Enter Both Serial Port Names (or enable Single Channel Mode)!")
             return
             
         self.serialport1.port = port1
-        self.serialport2.port = port2
+        if not self.single_channel_mode:
+            self.serialport2.port = port2
         
         try:
-            # 打开两个串口
+            # 打开串口
             if self.serialport1.is_open:
                 self.serialport1.close()
-            if self.serialport2.is_open:
-                self.serialport2.close()
-                
             self.serialport1.open()
-            self.serialport2.open()
+            
+            # 只有在双通道模式下才打开端口2
+            if not self.single_channel_mode:
+                if self.serialport2.is_open:
+                    self.serialport2.close()
+                self.serialport2.open()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to Open Serial Ports: {e}")
             return
@@ -736,8 +776,13 @@ class RealTimePlotApp(QMainWindow):
         
         self.run_stat = True
         # 更新菜单状态
-        self.start_action.setEnabled(False)  
-        self.stop_action.setEnabled(True)    
+        self.start_action.setEnabled(False)
+        self.stop_action.setEnabled(True)
+        
+        # 运行时禁止切换模式
+        self.single_mode_action.setEnabled(False)
+        # 运行时禁止调整更新间隔
+        self.update_interval_action.setEnabled(False)
 
         self.start_time = self.get_time()
         self.last_time = self.start_time
@@ -765,8 +810,13 @@ class RealTimePlotApp(QMainWindow):
         """停止监控"""
         self.run_stat = False
         # 更新菜单状态
-        self.start_action.setEnabled(True)   
+        self.start_action.setEnabled(True)
         self.stop_action.setEnabled(False)   
+
+        # 停止后允许切换模式
+        self.single_mode_action.setEnabled(True)
+        # 停止后允许调整更新间隔
+        self.update_interval_action.setEnabled(True)
 
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
@@ -785,13 +835,15 @@ class RealTimePlotApp(QMainWindow):
                 print("Serial Port 1 Closed")
             except Exception as e:
                 print(f"Failed to Close Serial Port 1: {e}")
-                
-        if self.serialport2.is_open:
-            try:
-                self.serialport2.close()
-                print("Serial Port 2 Closed")
-            except Exception as e:
-                print(f"Failed to Close Serial Port 2: {e}")
+        
+        # 只有在双通道模式下（或者端口开着的情况下）才关闭串口2
+        if not self.single_channel_mode or self.serialport2.is_open:
+            if self.serialport2.is_open:
+                try:
+                    self.serialport2.close()
+                    print("Serial Port 2 Closed")
+                except Exception as e:
+                    print(f"Failed to Close Serial Port 2: {e}")
         
         # 自动更新文件名为下一个序号
         current_filename = self.filename_input.text().strip()
@@ -863,7 +915,7 @@ class RealTimePlotApp(QMainWindow):
                     self, 
                     'Update Interval Changed', 
                     f'Update interval has been changed to {interval}ms.\n\n'
-                    f'Note: This change takes effect immediately for running monitoring.'
+                    f'This will apply to the next Run.'
                 )
             else:
                 # 显示确认消息
@@ -1274,25 +1326,31 @@ class RealTimePlotApp(QMainWindow):
         event.accept()
     
     def update_data(self):
-        """定时更新数据 - 双通道版本"""
+        """定时更新数据 - 支持单/双通道"""
         if not self.run_stat:
             return
         
         try:
-            # 发送请求到两个通道
+            # 发送请求
             self.send_data(1)
-            self.send_data(2)
+            if not self.single_channel_mode:
+                self.send_data(2)
             
-            # 接收两个通道的数据
+            # 接收数据
             current1 = self.recv_data(1)
-            current2 = self.recv_data(2)
+            
+            if not self.single_channel_mode:
+                current2 = self.recv_data(2)
+            else:
+                current2 = 0.0  # 单通道模式下，通道2数据强制为0
             
             # 检查数据有效性
-            if current1 is None or current2 is None:
+            if current1 is None:
+                return
+            if not self.single_channel_mode and current2 is None:
                 return
             
             # 检查电流值是否有效
-            # if current1 < 0 or current1 > 1000 or current2 < 0 or current2 > 1000:
             if current1 > 1000 or current2 > 1000:
                 print(f"Invalid Current Values: Ch1={current1} mA, Ch2={current2} mA, Skipping Calculation")
                 return
@@ -1304,15 +1362,13 @@ class RealTimePlotApp(QMainWindow):
             local_time = time.localtime(now)
             utc_time = time.gmtime(now)
             
-            # 格式化时间字符串
             local_time_str = time.strftime("%Y-%m-%d %H:%M:%S (UTC%z)", local_time)
             utc_time_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", utc_time)
             
-            # 优化积分计算：使用梯形法则 - 双通道
+            # 优化积分计算：使用梯形法则
             if self.last_time is not None:
                 delta_t = now - self.last_time
                 
-                # 跳过无效的时间间隔
                 if delta_t <= 0:
                     print(f"Invalid Time Interval: {delta_t}, Skipping Calculation")
                     return
@@ -1326,14 +1382,15 @@ class RealTimePlotApp(QMainWindow):
                     charge_segment1 = Decimal(str(current1)) * Decimal(str(delta_t))
                     self.column_int1 += charge_segment1
                 
-                # 通道2积分计算
-                if self.last_current2 is not None:
-                    avg_current2 = Decimal(str((self.last_current2 + current2) / 2.0))
-                    charge_segment2 = avg_current2 * Decimal(str(delta_t))
-                    self.column_int2 += charge_segment2
-                else:
-                    charge_segment2 = Decimal(str(current2)) * Decimal(str(delta_t))
-                    self.column_int2 += charge_segment2
+                # 通道2积分计算仅在双通道模式下进行
+                if not self.single_channel_mode:
+                    if self.last_current2 is not None:
+                        avg_current2 = Decimal(str((self.last_current2 + current2) / 2.0))
+                        charge_segment2 = avg_current2 * Decimal(str(delta_t))
+                        self.column_int2 += charge_segment2
+                    else:
+                        charge_segment2 = Decimal(str(current2)) * Decimal(str(delta_t))
+                        self.column_int2 += charge_segment2
             
             # 保存当前电流值用于下次计算
             self.last_current1 = current1
@@ -1346,24 +1403,30 @@ class RealTimePlotApp(QMainWindow):
             m = int((runtime - h * 3600) // 60)
             s = runtime - h * 3600 - m * 60
             
-            # 获取积分值的浮点数表示（用于显示）
             integral1_float = float(self.column_int1)
             integral2_float = float(self.column_int2)
             
             self.current1_label.setText(f"Channel 1 Current: {current1:.3f} mA")
-            self.current2_label.setText(f"Channel 2 Current: {current2:.3f} mA")
+            
+            # UI显示逻辑
+            if self.single_channel_mode:
+                self.current2_label.setText("Channel 2 Current: --- mA")
+                # 积分值保持显示数值(0或之前的值)
+            else:
+                self.current2_label.setText(f"Channel 2 Current: {current2:.3f} mA")
+
             self.runtime_label.setText(f"Run Time: {h:02d} Hours {m:02d} Minutes {s:05.2f} Seconds")
             self.integral1_label.setText(f"Channel 1 Integral: {integral1_float:.3f} mC")
             self.integral2_label.setText(f"Channel 2 Integral: {integral2_float:.3f} mC")
             self.timestamp_label.setText(f"Last Update Time (Local): {local_time_str}")
             self.utc_timestamp_label.setText(f"UTC Timestamp: {utc_time_str}")
             
-            # 更新绘图数据 - 双通道
+            # 更新绘图数据
             self.y_data1 = np.roll(self.y_data1, -1)
             self.y_data1[-1] = current1
             
             self.y_data2 = np.roll(self.y_data2, -1)
-            self.y_data2[-1] = current2
+            self.y_data2[-1] = current2 # 单通道模式下这里是0
             
             self.time_data = np.roll(self.time_data, -1)
             self.time_data[-1] = now
@@ -1372,30 +1435,36 @@ class RealTimePlotApp(QMainWindow):
             self.line1.set_ydata(self.y_data1)
             self.line2.set_ydata(self.y_data2)
             
+            # 控制第二条线的可见性
+            self.line2.set_visible(not self.single_channel_mode)
+            
             # 更新X轴标签为运行时间
             x_labels = []
             for i in range(len(self.x_data)):
                 time_sec = (self.time_data[i] - self.start_time) if self.time_data[i] > 0 else 0
                 x_labels.append(f"{time_sec:.1f}")
             
-            # 设置X轴刻度为运行时间
             tick_indices = range(0, self.data_points, max(1, self.data_points//10))
             self.ax.set_xticks(tick_indices)
             self.ax.set_xticklabels([x_labels[i] for i in tick_indices])
             
-            # 自动调整Y轴范围 - 考虑两个通道的数据
-            all_data = np.concatenate([self.y_data1, self.y_data2])
+            # 自动调整Y轴范围
+            if self.single_channel_mode:
+                all_data = self.y_data1 # 只看通道1
+            else:
+                all_data = np.concatenate([self.y_data1, self.y_data2])
+
             min_val = max(-1, min(all_data) - 0.1)
-            max_val = min(10, max(all_data) + 0.1)  # 上限设为10mA
+            max_val = min(10, max(all_data) + 0.1)
             self.ax.set_ylim(min_val, max_val)
             
             # 重绘图形
             self.canvas.draw()
             
-            # 写入数据到文件 - 双通道
+            # 写入数据到文件 (current2 在单通道模式下已设为0)
             self.write_data_row(now, runtime, current1, current2, integral1_float, integral2_float)
             
-            # 打印到控制台 - 双通道
+            # 打印到控制台
             print(f"Ch1: {current1:.3f} mA, Ch2: {current2:.3f} mA, Runtime: {runtime:.3f} s, "
                   f"Int1: {integral1_float:.3f} mC, Int2: {integral2_float:.3f} mC, UTC: {utc_time_str}")
             
