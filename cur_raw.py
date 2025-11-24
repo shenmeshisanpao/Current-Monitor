@@ -258,7 +258,6 @@ class RealTimePlotApp(QMainWindow):
         self.update_interval_action.setToolTip("Set Data Update Interval")
         run_menu.addAction(self.update_interval_action)
 
-
         # 帮助菜单
         help_menu = menu_bar.addMenu('Help')
         
@@ -808,6 +807,7 @@ class RealTimePlotApp(QMainWindow):
     
     def stop_monitoring(self):
         """停止监控"""
+
         self.run_stat = False
         # 更新菜单状态
         self.start_action.setEnabled(True)
@@ -1493,3 +1493,4 @@ def main():
 if __name__ == "__main__":
     main()
 
+解释
