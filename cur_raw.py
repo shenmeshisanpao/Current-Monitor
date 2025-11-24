@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Real-time Dual-Channel Current Monitor with PyQt5 and Auto-Save
+# Real-time Current Monitor
 # Author: ZhiCheng Zhang <zhangzhicheng@cnncmail.cn>
 # Date: 2025-11-24
 
@@ -120,7 +120,7 @@ class RealTimePlotApp(QMainWindow):
     def __init__(self):
         super().__init__()
         
-        self.setWindowTitle("Real-Time Current Monitoring System - Dual Channel")
+        self.setWindowTitle("Real-Time Current Monitoring System")
 
         # 设置窗口图标
         icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
@@ -950,7 +950,15 @@ class RealTimePlotApp(QMainWindow):
         dialog.setModal(True)
         
         # 设置对话框图标
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+        if getattr(sys, 'frozen', False):
+            # 如果是打包后的环境
+            base_path = sys._MEIPASS
+        else:
+            # 如果是正常运行环境
+            base_path = os.path.dirname(os.path.abspath(__file__))
+
+        icon_path = os.path.join(base_path, "logo.png")
+
         if os.path.exists(icon_path):
             dialog.setWindowIcon(QtGui.QIcon(icon_path))
         
@@ -1233,8 +1241,13 @@ class RealTimePlotApp(QMainWindow):
         content_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         
         # 读取外部HTML文件
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        about_file = os.path.join(current_dir, 'about.html')
+        if getattr(sys, 'frozen', False):
+            # 如果是打包后的环境
+            base_path = sys._MEIPASS
+        else:
+            # 如果是正常运行环境
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        about_file = os.path.join(base_path, 'about.html')
         
         try:
             with open(about_file, 'r', encoding='utf-8') as f:
@@ -1243,7 +1256,7 @@ class RealTimePlotApp(QMainWindow):
             about_text = """
             <div style="font-family: Arial, sans-serif; line-height: 1.6;">
             <center>
-            <h2 style="color: #2E86AB;">Real-Time Current Monitoring System - Dual Channel</h2>
+            <h2 style="color: #2E86AB;">Real-Time Current Monitoring System</h2>
             <p><b>Error:</b> about.html file not found</p>
             <p>Please ensure the about.html file is in the same directory as the main program.</p>
             </center>
@@ -1253,7 +1266,7 @@ class RealTimePlotApp(QMainWindow):
             about_text = f"""
             <div style="font-family: Arial, sans-serif; line-height: 1.6;">
             <center>
-            <h2 style="color: #2E86AB;">Real-Time Current Monitoring System - Dual Channel</h2>
+            <h2 style="color: #2E86AB;">Real-Time Current Monitoring System</h2>
             <p><b>Error:</b> Failed to load about.html</p>
             <p>Error details: {str(e)}</p>
             </center>
@@ -1301,8 +1314,13 @@ class RealTimePlotApp(QMainWindow):
         text_browser.setOpenExternalLinks(True)
         
         # 获取 HTML 文件的绝对路径
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        html_file = os.path.join(current_dir, 'tutorial.html')
+        if getattr(sys, 'frozen', False):
+            # 如果是打包后的环境
+            base_path = sys._MEIPASS
+        else:
+            # 如果是正常运行环境
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        html_file = os.path.join(base_path, 'tutorial.html')
         
         if os.path.exists(html_file):
             # 使用 file:// URL 协议
@@ -1492,5 +1510,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-解释
