@@ -2,20 +2,30 @@
 # -*- coding: utf-8 -*-
 # Real-time Current Monitor
 # Author: ZhiCheng Zhang <zhangzhicheng@cnncmail.cn>
-# Date: 2025-11-24
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import fcntl  # Linux/Unix系统的文件锁
+import sys
+import os
 import tempfile
 import atexit
-import sys
 import serial
 import struct 
 import time
 import ctypes
 import numpy as np
-import os
 import shutil
-import decimal
 import re
 from decimal import Decimal, getcontext
 from PyQt5 import QtWidgets, QtCore, QtGui
@@ -26,6 +36,12 @@ from PyQt5.QtCore import (QTimer, QUrl)
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib import rcParams
+
+# 文件锁
+if os.name == 'nt':  # Windows
+    import msvcrt
+else:  # Linux/Unix
+    import fcntl
 
 # 设置高精度计算
 getcontext().prec = 15  # 设置Decimal精度为15位小数
@@ -79,8 +95,18 @@ def hex2float(h):
     fp = ctypes.cast(cp, ctypes.POINTER(ctypes.c_float))
     return fp.contents.value
 
+# 获取资源的绝对路径，用于 PyInstaller 打包
+def resource_path(relative_path):
+    try:
+        # PyInstaller 创建临时文件夹，将路径存储在 _MEIPASS 中
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
 class SingleInstanceLock:
-    """单实例锁管理器"""
+    """跨平台单实例锁管理器"""
     def __init__(self, lock_file_name="current_monitor.lock"):
         self.lock_file_name = lock_file_name
         self.lock_file_path = os.path.join(tempfile.gettempdir(), lock_file_name)
@@ -90,8 +116,13 @@ class SingleInstanceLock:
         """获取锁"""
         try:
             self.lock_file = open(self.lock_file_path, 'w')
-            # 尝试获取独占锁
-            fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            
+            if os.name == 'nt': # Windows 系统
+                # 锁定文件的前10个字节，LK_NBLCK 表示非阻塞锁
+                msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_NBLCK, 10)
+            else: # Linux/Unix 系统
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                
             # 写入进程ID
             self.lock_file.write(str(os.getpid()))
             self.lock_file.flush()
@@ -100,7 +131,10 @@ class SingleInstanceLock:
             return True
         except (IOError, OSError):
             if self.lock_file:
-                self.lock_file.close()
+                try:
+                    self.lock_file.close()
+                except:
+                    pass
                 self.lock_file = None
             return False
     
@@ -108,9 +142,17 @@ class SingleInstanceLock:
         """释放锁"""
         if self.lock_file:
             try:
-                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+                if os.name == 'nt': # Windows 解锁
+                    self.lock_file.seek(0)
+                    msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_UNLCK, 10)
+                else: # Linux 解锁
+                    fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+                
                 self.lock_file.close()
-                os.remove(self.lock_file_path)
+                try:
+                    os.remove(self.lock_file_path)
+                except:
+                    pass
             except:
                 pass
             finally:
@@ -123,7 +165,7 @@ class RealTimePlotApp(QMainWindow):
         self.setWindowTitle("Real-Time Current Monitoring System")
 
         # 设置窗口图标
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+        icon_path = resource_path("logo.png") 
         if os.path.exists(icon_path):
             icon = QtGui.QIcon(icon_path)
             self.setWindowIcon(icon)
@@ -134,7 +176,10 @@ class RealTimePlotApp(QMainWindow):
         
         # 初始化两个串口
         self.serialport1 = serial.Serial()
-        self.serialport1.port = '/dev/ttyUSB0'
+        if sys.platform.startswith('win'):
+            self.serialport1.port = 'COM3'  # Windows 默认端口
+        else:
+            self.serialport1.port = '/dev/ttyUSB0' # Linux 默认端口
         self.serialport1.baudrate = 9600
         self.serialport1.parity = 'N'
         self.serialport1.bytesize = 8
@@ -142,7 +187,10 @@ class RealTimePlotApp(QMainWindow):
         self.serialport1.timeout = 0.1
         
         self.serialport2 = serial.Serial()
-        self.serialport2.port = '/dev/ttyUSB1'
+        if sys.platform.startswith('win'):
+            self.serialport2.port = 'COM4'  # Windows 默认端口
+        else:
+            self.serialport2.port = '/dev/ttyUSB1' # Linux 默认端口
         self.serialport2.baudrate = 9600
         self.serialport2.parity = 'N'
         self.serialport2.bytesize = 8
@@ -666,7 +714,6 @@ class RealTimePlotApp(QMainWindow):
         
     def extract_number_from_filename(self, filename):
         """从文件名中提取末尾的四位数字"""
-        import re
         # 移除.csv扩展名
         base_name = filename.replace('.csv', '')
         # 匹配末尾的四位数字
@@ -1022,53 +1069,6 @@ class RealTimePlotApp(QMainWindow):
         # 连接鼠标移动事件
         self.canvas.mpl_connect('motion_notify_event', self.on_hover)
 
-    # def on_hover(self, event):
-    #     """鼠标悬停事件处理"""
-    #     if not self.run_stat or event.inaxes != self.ax:
-    #         self.hover_annotation.set_visible(False)
-    #         self.canvas.draw_idle()
-    #         return
-        
-    #     # 获取鼠标位置
-    #     x_mouse = event.xdata
-    #     y_mouse = event.ydata
-        
-    #     if x_mouse is None or y_mouse is None:
-    #         self.hover_annotation.set_visible(False)
-    #         self.canvas.draw_idle()
-    #         return
-        
-    #     # 找到最接近的数据点
-    #     closest_point = self.find_closest_point(x_mouse, y_mouse)
-        
-    #     if closest_point:
-    #         channel, index, x_val, y_val, time_val = closest_point
-            
-    #         # 计算运行时间
-    #         if self.start_time and time_val > 0:
-    #             runtime = time_val - self.start_time
-    #             time_str = f"{runtime:.2f}s"
-    #         else:
-    #             time_str = "N/A"
-            
-    #         # 创建显示文本
-    #         hover_text = f"Channel {channel}\nTime: {time_str}\nCurrent: {y_val:.3f} mA"
-            
-    #         # 更新注释
-    #         self.hover_annotation.xy = (x_val, y_val)
-    #         self.hover_annotation.set_text(hover_text)
-    #         self.hover_annotation.set_visible(True)
-            
-    #         # 设置不同通道的颜色
-    #         if channel == 1:
-    #             self.hover_annotation.get_bbox_patch().set_facecolor('lightblue')
-    #         else:
-    #             self.hover_annotation.get_bbox_patch().set_facecolor('lightcoral')
-    #     else:
-    #         self.hover_annotation.set_visible(False)
-        
-    #     self.canvas.draw_idle()
-
     def on_hover(self, event):
         """鼠标悬停事件处理"""
         # 只检查鼠标是否在图表区域内，不检查运行状态
@@ -1241,13 +1241,7 @@ class RealTimePlotApp(QMainWindow):
         content_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         
         # 读取外部HTML文件
-        if getattr(sys, 'frozen', False):
-            # 如果是打包后的环境
-            base_path = sys._MEIPASS
-        else:
-            # 如果是正常运行环境
-            base_path = os.path.dirname(os.path.abspath(__file__))
-        about_file = os.path.join(base_path, 'about.html')
+        about_file = resource_path('about.html')
         
         try:
             with open(about_file, 'r', encoding='utf-8') as f:
@@ -1314,13 +1308,7 @@ class RealTimePlotApp(QMainWindow):
         text_browser.setOpenExternalLinks(True)
         
         # 获取 HTML 文件的绝对路径
-        if getattr(sys, 'frozen', False):
-            # 如果是打包后的环境
-            base_path = sys._MEIPASS
-        else:
-            # 如果是正常运行环境
-            base_path = os.path.dirname(os.path.abspath(__file__))
-        html_file = os.path.join(base_path, 'tutorial.html')
+        html_file = resource_path('tutorial.html')
         
         if os.path.exists(html_file):
             # 使用 file:// URL 协议
@@ -1491,6 +1479,14 @@ class RealTimePlotApp(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+
+    # 启用文件锁
+    instance_lock = SingleInstanceLock()    # 创建锁对象
+        # 尝试获取锁，如果失败说明已有程序在运行
+    if not instance_lock.acquire_lock():
+        QMessageBox.warning(None, "Warning", "Program is already running!")
+        sys.exit(1)
+
     # 设置应用程序图标
     icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
     if os.path.exists(icon_path):
