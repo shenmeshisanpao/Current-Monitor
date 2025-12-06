@@ -4,6 +4,6 @@ This program supports automatic data saving, charge integral calculation， grap
 
 To run this code, you need to install thses python packages: numpy, matplotlib, pyqt5 and pyserial. To run "pip install numpy matplotlib PyQt5 pyserial" or "conda install numpy matplotlib pyqt5 pyserial"(if you use conda) in Terminal to install these packages.
 
-This program can run on Linux or Windows.
+This program can run on Linux (≥ glibc 2.17) or Windows (≥ Windows 7).
 
 This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](https://www.gnu.org/licenses/gpl-3.0.txt) file for details.
