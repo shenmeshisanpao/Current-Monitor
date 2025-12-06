@@ -21,12 +21,13 @@ import os
 import tempfile
 import atexit
 import serial
-import struct 
+import struct
 import time
 import ctypes
 import numpy as np
 import shutil
 import re
+import socket
 from decimal import Decimal, getcontext
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel, 
@@ -164,6 +165,11 @@ class RealTimePlotApp(QMainWindow):
         
         self.setWindowTitle("Real-Time Current Monitoring System")
 
+        # 默认模式: "serial" 或 "network"
+        self.connection_mode = "serial"
+        self.socket1 = None
+        self.socket2 = None
+
         # 设置窗口图标
         icon_path = resource_path("logo.png") 
         if os.path.exists(icon_path):
@@ -239,7 +245,7 @@ class RealTimePlotApp(QMainWindow):
         """创建菜单栏"""
         menu_bar = self.menuBar()
         
-        # 文件菜单
+        ## 文件菜单
         file_menu = menu_bar.addMenu('File')
         
         # 添加创建快照菜单项
@@ -261,7 +267,28 @@ class RealTimePlotApp(QMainWindow):
         exit_action.setShortcut('Ctrl+Q')
         file_menu.addAction(exit_action)
         
-        # 运行菜单
+
+        ## 连接菜单
+        conn_menu = menu_bar.addMenu('Connection')
+        
+        self.mode_serial_action = QtWidgets.QAction('Serial Port Mode', self)
+        self.mode_serial_action.setCheckable(True)
+        self.mode_serial_action.setChecked(True)
+        self.mode_serial_action.triggered.connect(lambda: self.switch_connection_mode("serial"))
+        conn_menu.addAction(self.mode_serial_action)
+        
+        self.mode_network_action = QtWidgets.QAction('TCP Network Mode', self)
+        self.mode_network_action.setCheckable(True)
+        self.mode_network_action.setChecked(False)
+        self.mode_network_action.triggered.connect(lambda: self.switch_connection_mode("network"))
+        conn_menu.addAction(self.mode_network_action)
+
+        # 互斥组，确保只能选一个
+        mode_group = QtWidgets.QActionGroup(self)
+        mode_group.addAction(self.mode_serial_action)
+        mode_group.addAction(self.mode_network_action)
+
+        ## 运行菜单
         run_menu = menu_bar.addMenu('Run')
         
         # 开始监控菜单项
@@ -306,7 +333,7 @@ class RealTimePlotApp(QMainWindow):
         self.update_interval_action.setToolTip("Set Data Update Interval")
         run_menu.addAction(self.update_interval_action)
 
-        # 帮助菜单
+        ## 帮助菜单
         help_menu = menu_bar.addMenu('Help')
         
         # 教程菜单项
@@ -494,39 +521,54 @@ class RealTimePlotApp(QMainWindow):
         main_layout.addWidget(self.canvas)
     
     def test_serial_connection(self, channel):
-        """测试串口连接"""
-        if channel == 1:
-            port = self.port1_input.text().strip()
-            serialport = self.serialport1
-            channel_name = "Channel 1"
-        else:
-            port = self.port2_input.text().strip()
-            serialport = self.serialport2
-            channel_name = "Channel 2"
-            
-        if not port:
-            QMessageBox.warning(self, "Warning", f"Please Enter {channel_name} Serial Port Name")
+        """测试连接（串口和网络）"""
+        input_text = self.port1_input.text().strip() if channel == 1 else self.port2_input.text().strip()   # 获取输入内容
+        channel_name = f"Channel {channel}"
+        
+        if not input_text:
+            QMessageBox.warning(self, "Warning", f"Please Enter {channel_name} Configuration")
             return
-            
-        try:
-            # 尝试打开串口
-            serialport.port = port
-            serialport.open()
-            
-            if serialport.is_open:
+
+        if self.connection_mode == "serial":
+            # 串口测试
+            serialport = self.serialport1 if channel == 1 else self.serialport2
+            try:
+                serialport.port = input_text
+                if serialport.is_open: serialport.close()
+                serialport.open()
                 serialport.close()
-                QMessageBox.information(self, "Test Successful", f"{channel_name} Serial Port {port} Test Successful!")
+                
+                QMessageBox.information(self, "Test Successful", f"{channel_name} Serial Port Test Successful!")
                 self.save_status_label.setText(f"{channel_name} Serial Port Test: Successful")
                 self.save_status_label.setStyleSheet("color: green;")
-            else:
-                QMessageBox.warning(self, "Test Failed", f"Cannot Open {channel_name} Serial Port {port}")
-                self.save_status_label.setText(f"{channel_name} Serial Port Test: Failed")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"{channel_name} Serial Port Test Failed: {str(e)}")
+                self.save_status_label.setText(f"{channel_name} Serial Port Test: Failed - {str(e)}")
                 self.save_status_label.setStyleSheet("color: red;")
+        
+        else:
+            # 网络测试
+            try:
+                if ":" not in input_text:
+                    raise ValueError("Invalid Format. Use IP:Port (e.g., 192.168.1.253:1030)")
                 
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"{channel_name} Serial Port Test Failed: {str(e)}")
-            self.save_status_label.setText(f"{channel_name} Serial Port Test: Failed - {str(e)}")
-            self.save_status_label.setStyleSheet("color: red;")
+                ip, port_str = input_text.split(":")
+                port = int(port_str)
+                
+                # 创建临时 socket 测试连接
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(2) # 2秒超时
+                s.connect((ip, port))
+                s.close()
+                
+                QMessageBox.information(self, "Connect Successful", f"{channel_name} Network Connect Successful!")
+                self.save_status_label.setText(f"{channel_name} Network Test: Successful")
+                self.save_status_label.setStyleSheet("color: green;")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"{channel_name} Network Test Failed: {str(e)}")
+                self.save_status_label.setText(f"{channel_name} Network Test: Failed - {str(e)}")
+                self.save_status_label.setStyleSheet("color: red;")
+
     
     def file_mode_changed(self, index):
         """文件模式改变时的处理"""
@@ -733,8 +775,50 @@ class RealTimePlotApp(QMainWindow):
         else:
             # 如果没有找到四位数字格式，保持原文件名不变
             return current_filename
+        
+    def switch_connection_mode(self, mode):
+        """切换连接模式：串口 or 网络"""
+        if self.run_stat:
+            QMessageBox.warning(self, "Warning", "Cannot switch mode while monitoring is running!")
 
-    
+            # 恢复勾选状态
+            if self.connection_mode == "serial":
+                self.mode_serial_action.setChecked(True)
+            else:
+                self.mode_network_action.setChecked(True)
+            return
+
+        self.connection_mode = mode
+        
+        if mode == "network":
+            self.port1_label.setText("Channel 1 Address (IP:Port):")
+            self.port1_input.setToolTip("Format: 192.168.1.253:1030")
+            self.port1_input.setText("192.168.1.253:1030") # 默认值示例
+            
+            self.port2_label.setText("Channel 2 Address (IP:Port):")
+            self.port2_input.setToolTip("Format: 192.168.1.253:1031")
+            self.port2_input.setText("192.168.1.253:1031")  # 默认值示例
+            
+            self.test_serial1_button.setText("Test Network 1")
+            self.test_serial2_button.setText("Test Network 2")
+        else:
+            self.port1_label.setText("Channel 1 Serial Port:")
+            self.port1_input.setToolTip("Enter Channel 1 Serial Port Device Name")
+            # 恢复默认串口名，根据系统判断
+            default_port1 = 'COM3' if sys.platform.startswith('win') else '/dev/ttyUSB0'
+            self.port1_input.setText(default_port1)
+
+            self.port2_label.setText("Channel 2 Serial Port:")
+            self.port2_input.setToolTip("Enter Channel 2 Serial Port Device Name")
+            # 恢复默认串口名，根据系统判断
+            default_port2 = 'COM4' if sys.platform.startswith('win') else '/dev/ttyUSB1'
+            self.port2_input.setText(default_port2) 
+
+            self.test_serial1_button.setText("Test Port 1")
+            self.test_serial2_button.setText("Test Port 2")
+            
+        print(f"Switched to {mode} mode")
+
     def send_data(self, channel):
         """发送数据请求到指定通道"""
         slave_address = 1
@@ -744,24 +828,42 @@ class RealTimePlotApp(QMainWindow):
         
         try:
             request = build_request(slave_address, function_code, start_address, quantity)
-            if channel == 1:
-                self.serialport1.write(request)
+
+            if self.connection_mode == "serial":
+                # 串口发送
+                if channel == 1:
+                    self.serialport1.write(request)
+                else:
+                    self.serialport2.write(request)
             else:
-                self.serialport2.write(request)
+                # 网络发送
+                sock = self.socket1 if channel == 1 else self.socket2
+                if sock:
+                    sock.sendall(request)                
         except Exception as e:
             print(f"Failed to Send Request to Channel {channel}: {e}")
     
     def recv_data(self, channel):
         """接收并解析指定通道的数据"""
         try:
-            # 读取响应数据
-            if channel == 1:
-                response = self.serialport1.read(9)
+            response = b''
+
+            if self.connection_mode == "serial":
+                # 串口接收
+                port = self.serialport1 if channel == 1 else self.serialport2
+                response = port.read(9) # 期望读取9个字节
             else:
-                response = self.serialport2.read(9)
-                
+                # 网络接收
+                sock = self.socket1 if channel == 1 else self.socket2
+                if sock:
+                    # 网络接收可能需要一点缓冲，这里简单处理
+                    # 因为是透传，仪表回传的也是Modbus RTU帧，长度固定为9字节
+                    # (地址1 + 功能1 + 字节数1 + 数据4 + CRC2 = 9)
+                    response = sock.recv(1024) 
+            
             if len(response) < 9:
-                raise ValueError(f"Channel {channel} Response Data Incomplete")
+                # 可以在这里加个日志，但不抛出异常以免刷屏
+                return None
             
             # 解析响应
             slave_address, function_code, registers = parse_response(response)
@@ -782,39 +884,49 @@ class RealTimePlotApp(QMainWindow):
     
     def start_monitoring(self):
         """开始监控"""
-        # 获取串口名
-        port1 = self.port1_input.text().strip()
-        port2 = self.port2_input.text().strip()
+        # 获取串口名/网络地址
+        addr1 = self.port1_input.text().strip()
+        addr2 = self.port2_input.text().strip()
         
-        # 检查串口名输入
-        if not port1:
-            QMessageBox.warning(self, "Warning", "Please Enter Channel 1 Serial Port Name!")
+        if not addr1:
+            QMessageBox.warning(self, "Warning", "Please Enter Channel 1 Configuration!")
+            return
+        if not self.single_channel_mode and not addr2:
+            QMessageBox.warning(self, "Warning", "Please Enter Channel 2 Configuration!")
+            return
+            
+        try:
+            if self.connection_mode == "serial":
+                # 串口模式
+                self.serialport1.port = addr1
+                if self.serialport1.is_open: self.serialport1.close()
+                self.serialport1.open()
+                self.serialport1.reset_input_buffer()
+                
+                if not self.single_channel_mode:
+                    self.serialport2.port = addr2
+                    if self.serialport2.is_open: self.serialport2.close()
+                    self.serialport2.open()
+                    self.serialport2.reset_input_buffer()
+            else:
+                # 网络模式
+                # 解析地址1
+                ip1, p1 = addr1.split(':')
+                self.socket1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.socket1.settimeout(1.0) # 设置超时
+                self.socket1.connect((ip1, int(p1)))
+                
+                if not self.single_channel_mode:
+                    # 解析地址2
+                    ip2, p2 = addr2.split(':')
+                    self.socket2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.socket2.settimeout(1.0)
+                    self.socket2.connect((ip2, int(p2)))
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Connection Failed: {e}")
             return
 
-        # 只有在双通道模式下才检查端口2
-        if not self.single_channel_mode and not port2:
-            QMessageBox.warning(self, "Warning", "Please Enter Both Serial Port Names (or enable Single Channel Mode)!")
-            return
-            
-        self.serialport1.port = port1
-        if not self.single_channel_mode:
-            self.serialport2.port = port2
-        
-        try:
-            # 打开串口
-            if self.serialport1.is_open:
-                self.serialport1.close()
-            self.serialport1.open()
-            
-            # 只有在双通道模式下才打开端口2
-            if not self.single_channel_mode:
-                if self.serialport2.is_open:
-                    self.serialport2.close()
-                self.serialport2.open()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to Open Serial Ports: {e}")
-            return
-        
         # 打开数据文件
         if not self.open_data_file():
             QMessageBox.critical(self, "Error", "Cannot Open Data File, Monitoring Cannot Start!")
@@ -830,6 +942,11 @@ class RealTimePlotApp(QMainWindow):
         # 运行时禁止调整更新间隔
         self.update_interval_action.setEnabled(False)
 
+        # 禁用模式切换
+        self.mode_serial_action.setEnabled(False)
+        self.mode_network_action.setEnabled(False)
+
+        # 初始化计时和数据
         self.start_time = self.get_time()
         self.last_time = self.start_time
         self.column_int1 = Decimal('0.0')  # 重置通道1电荷量
@@ -849,13 +966,50 @@ class RealTimePlotApp(QMainWindow):
         # 如果脉冲提醒功能开启，启动10秒后的提醒定时器
         if self.pulse_reminder_enabled:
             self.pulse_reminder_timer.start(10 * 1000)  # 10秒后提醒
-                        
+        
+        # 重新启动数据更新定时器
+        self.timer.start(self.update_interval)                        
         print("Monitoring Started")
     
     def stop_monitoring(self):
         """停止监控"""
 
         self.run_stat = False
+        self.timer.stop()  # 先停定时器，防止继续调用 send/recv
+
+        # 关闭串口
+        if self.serialport1.is_open:
+            try:
+                self.serialport1.close()
+                print("Serial Port 1 Closed")
+            except Exception as e:
+                print(f"Failed to Close Serial Port 1: {e}")   
+
+        if self.serialport2.is_open:
+            try:
+                self.serialport2.close()
+                print("Serial Port 2 Closed")
+            except Exception as e:
+                print(f"Failed to Close Serial Port 2: {e}")
+
+        # 关闭网络连接
+        if self.socket1:
+            try:
+                self.socket1.close()
+                print("Socket 1 Closed")
+            except: pass
+            self.socket1 = None
+            
+        if self.socket2:
+            try:
+                self.socket2.close()
+                print("Socket 2 Closed")
+            except: pass
+            self.socket2 = None        
+
+        # 关闭数据文件
+        self.close_data_file()
+
         # 更新菜单状态
         self.start_action.setEnabled(True)
         self.stop_action.setEnabled(False)   
@@ -868,29 +1022,13 @@ class RealTimePlotApp(QMainWindow):
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         
-        # 关闭数据文件
-        self.close_data_file()
+        # 启用模式切换
+        self.mode_serial_action.setEnabled(True)
+        self.mode_network_action.setEnabled(True)
 
         # 停止脉冲提醒定时器
         if self.pulse_reminder_timer.isActive():
             self.pulse_reminder_timer.stop()
-        
-        # 关闭串口
-        if self.serialport1.is_open:
-            try:
-                self.serialport1.close()
-                print("Serial Port 1 Closed")
-            except Exception as e:
-                print(f"Failed to Close Serial Port 1: {e}")
-        
-        # 只有在双通道模式下（或者端口开着的情况下）才关闭串口2
-        if not self.single_channel_mode or self.serialport2.is_open:
-            if self.serialport2.is_open:
-                try:
-                    self.serialport2.close()
-                    print("Serial Port 2 Closed")
-                except Exception as e:
-                    print(f"Failed to Close Serial Port 2: {e}")
         
         # 自动更新文件名为下一个序号
         current_filename = self.filename_input.text().strip()
@@ -903,7 +1041,6 @@ class RealTimePlotApp(QMainWindow):
         
         print(f"Monitoring Stopped")
 
-    
     def open_data_folder(self):
         """打开数据文件所在的文件夹"""
         # 获取当前设置的文件路径
@@ -1123,7 +1260,6 @@ class RealTimePlotApp(QMainWindow):
         
         self.canvas.draw_idle()
 
-
     def find_closest_point(self, x_mouse, y_mouse):
         """找到最接近鼠标位置的数据点"""
         min_distance = float('inf')
@@ -1296,7 +1432,6 @@ class RealTimePlotApp(QMainWindow):
         # 显示对话框
         about_dialog.exec_()
 
-
     def show_tutorial(self):
         """显示教程对话框"""
         dialog = QDialog(self)
@@ -1325,7 +1460,7 @@ class RealTimePlotApp(QMainWindow):
         dialog.setLayout(layout)
         
         dialog.exec_()
-            
+
     def closeEvent(self, event):
         """关闭事件，确保资源被正确释放"""
         self.stop_monitoring()
