@@ -676,7 +676,7 @@ class RealTimePlotApp(QMainWindow):
         
         try:
             # 写入双通道数据
-            self.file_handle.write(f"{time_val:.1f},{runtime:.3f},{current1:.3f},{current2:.3f},{integral1:.3f},{integral2:.3f}\n")
+            self.file_handle.write(f"{time_val:.1f},{runtime:.4f},{current1:.4f},{current2:.4f},{integral1:.4f},{integral2:.4f}\n")
             self.file_handle.flush()  # 确保数据立即写入
         except Exception as e:
             self.save_status_label.setText(f"Save Status: Write Failed - {str(e)}")
@@ -1243,7 +1243,7 @@ class RealTimePlotApp(QMainWindow):
                 time_str = "N/A"
             
             # 创建显示文本
-            hover_text = f"Channel {channel}\nTime: {time_str}\nCurrent: {y_val:.3f} mA"
+            hover_text = f"Channel {channel}\nTime: {time_str}\nCurrent: {y_val:.4f} mA"
             
             # 更新注释
             self.hover_annotation.xy = (x_val, y_val)
@@ -1547,18 +1547,18 @@ class RealTimePlotApp(QMainWindow):
             integral1_float = float(self.column_int1)
             integral2_float = float(self.column_int2)
             
-            self.current1_label.setText(f"Channel 1 Current: {current1:.3f} mA")
+            self.current1_label.setText(f"Channel 1 Current: {current1:.4f} mA")
             
             # UI显示逻辑
             if self.single_channel_mode:
                 self.current2_label.setText("Channel 2 Current: --- mA")
                 # 积分值保持显示数值(0或之前的值)
             else:
-                self.current2_label.setText(f"Channel 2 Current: {current2:.3f} mA")
+                self.current2_label.setText(f"Channel 2 Current: {current2:.4f} mA")
 
             self.runtime_label.setText(f"Run Time: {h:02d} Hours {m:02d} Minutes {s:05.2f} Seconds")
-            self.integral1_label.setText(f"Channel 1 Integral: {integral1_float:.3f} mC")
-            self.integral2_label.setText(f"Channel 2 Integral: {integral2_float:.3f} mC")
+            self.integral1_label.setText(f"Channel 1 Integral: {integral1_float:.4f} mC")
+            self.integral2_label.setText(f"Channel 2 Integral: {integral2_float:.4f} mC")
             self.timestamp_label.setText(f"Last Update Time (Local): {local_time_str}")
             self.utc_timestamp_label.setText(f"UTC Timestamp: {utc_time_str}")
             
@@ -1606,8 +1606,8 @@ class RealTimePlotApp(QMainWindow):
             self.write_data_row(now, runtime, current1, current2, integral1_float, integral2_float)
             
             # 打印到控制台
-            print(f"Ch1: {current1:.3f} mA, Ch2: {current2:.3f} mA, Runtime: {runtime:.3f} s, "
-                  f"Int1: {integral1_float:.3f} mC, Int2: {integral2_float:.3f} mC, UTC: {utc_time_str}")
+            print(f"Ch1: {current1:.4f} mA, Ch2: {current2:.4f} mA, Runtime: {runtime:.4f} s, "
+                  f"Int1: {integral1_float:.4f} mC, Int2: {integral2_float:.4f} mC, UTC: {utc_time_str}")
             
         except Exception as e:
             print(f"Error Updating Data: {e}")
