@@ -221,6 +221,16 @@ class RealTimePlotApp(QMainWindow):
         self.file_mode = "append"  # 默认文件模式：追加
         self.update_interval = 100  # 默认更新间隔100ms
         self.single_channel_mode = False # 默认为双通道模式
+        self.unit_ch1 = "mA"    # 初始化通道单位，默认为 mA
+        self.unit_ch2 = "mA"   
+        self.unit_factors = {   # 定义单位到 mA 的转换系数
+            "mA": 1.0,
+            "μA": 0.001,
+            "nA": 0.000001
+        }
+        # 初始化电流过滤阈值 (默认为 1000 mA)
+        self.limit_ch1_ma = 1000.0 
+        self.limit_ch2_ma = 1000.0
 
         # 脉冲提醒相关变量
         self.pulse_reminder_enabled = True  # 脉冲提醒开关，默认开启
@@ -311,27 +321,42 @@ class RealTimePlotApp(QMainWindow):
         self.single_mode_action.setCheckable(True)
         self.single_mode_action.setChecked(False)
         self.single_mode_action.triggered.connect(self.toggle_single_mode)
+        self.single_mode_action.setShortcut('Ctrl+Shift+S')
         self.single_mode_action.setToolTip("Enable to monitor only Channel 1. Cannot be changed while running.")
         run_menu.addAction(self.single_mode_action)
 
-        run_menu.addSeparator()
+        # run_menu.addSeparator()
 
         # 脉冲提醒开关菜单项
         self.pulse_reminder_action = QtWidgets.QAction('Pulse Reminder', self)
         self.pulse_reminder_action.setCheckable(True)
         self.pulse_reminder_action.setChecked(True)  # 默认开启
         self.pulse_reminder_action.triggered.connect(self.toggle_pulse_reminder)
+        self.pulse_reminder_action.setShortcut('Ctrl+Shift+P')
         self.pulse_reminder_action.setToolTip("Enable/Disable Pulse Reminder")
         run_menu.addAction(self.pulse_reminder_action)
 
         run_menu.addSeparator()
 
+        # 设置通道单位菜单项
+        self.set_units_action = QtWidgets.QAction('Set Channel Units', self)
+        self.set_units_action.triggered.connect(self.set_channel_units)
+        self.set_units_action.setToolTip("Configure measurement units (mA, μA, nA)")
+        run_menu.addAction(self.set_units_action)
+
+        # run_menu.addSeparator()
+
         # 更新间隔设置菜单项
         self.update_interval_action = QtWidgets.QAction('Set Update Interval', self)
         self.update_interval_action.triggered.connect(self.set_update_interval)
-        self.update_interval_action.setShortcut('Ctrl+I')
         self.update_interval_action.setToolTip("Set Data Update Interval")
         run_menu.addAction(self.update_interval_action)
+
+        # 设置电流阈值菜单项
+        self.set_limit_action = QtWidgets.QAction('Set Current Threshold', self)
+        self.set_limit_action.triggered.connect(self.set_current_threshold)
+        self.set_limit_action.setToolTip("Set the maximum current limit for filtering noise")
+        run_menu.addAction(self.set_limit_action)
 
         ## 帮助菜单
         help_menu = menu_bar.addMenu('Help')
@@ -500,14 +525,24 @@ class RealTimePlotApp(QMainWindow):
         self.canvas = FigureCanvas(self.figure)
         self.ax = self.figure.add_subplot(111)
         self.ax.set_xlabel('time (s)')
-        self.ax.set_ylabel('current (mA)')
+
+        # 左侧 Y 轴 - 通道 1 (蓝色)
+        self.ax.set_ylabel(f'Channel 1 Current ({self.unit_ch1})', color='#1f77b4', fontweight='bold')
+        self.ax.tick_params(axis='y', labelcolor='#1f77b4')
         
-        # 创建两条线
-        self.line1, = self.ax.plot(self.x_data, self.y_data1, 'b-', label='Channel 1', linewidth=2)
-        self.line2, = self.ax.plot(self.x_data, self.y_data2, 'r-', label='Channel 2', linewidth=2)
+        # 右侧 Y 轴 - 通道 2 (橙色) - 共享 X 轴
+        self.ax2 = self.ax.twinx()
+        self.ax2.set_ylabel(f'Channel 2 Current ({self.unit_ch2})', color='#ff7f0e', fontweight='bold')
+        self.ax2.tick_params(axis='y', labelcolor='#ff7f0e')
         
-        self.ax.set_ylim(0, 10)
-        self.ax.legend()  # 显示图例
+        # 创建两条线，分别绑定到不同的轴
+        self.line1, = self.ax.plot(self.x_data, self.y_data1, 'b-', color='#1f77b4', label='Channel 1', linewidth=2)
+        self.line2, = self.ax2.plot(self.x_data, self.y_data2, 'r-', color='#ff7f0e', label='Channel 2', linewidth=2)
+        
+        # 合并图例 (因为有两个轴，需要手动收集图例句柄)
+        lines = [self.line1, self.line2]
+        labels = [l.get_label() for l in lines]
+        self.ax.legend(lines, labels, loc='best')
         self.ax.grid(True, alpha=0.3)
 
         # 鼠标悬停功能
@@ -676,7 +711,7 @@ class RealTimePlotApp(QMainWindow):
         
         try:
             # 写入双通道数据
-            self.file_handle.write(f"{time_val:.1f},{runtime:.4f},{current1:.4f},{current2:.4f},{integral1:.4f},{integral2:.4f}\n")
+            self.file_handle.write(f"{time_val:.1f},{runtime:.4f},{current1:.8e},{current2:.8e},{integral1:.4e},{integral2:.4e}\n")
             self.file_handle.flush()  # 确保数据立即写入
         except Exception as e:
             self.save_status_label.setText(f"Save Status: Write Failed - {str(e)}")
@@ -941,6 +976,9 @@ class RealTimePlotApp(QMainWindow):
         self.single_mode_action.setEnabled(False)
         # 运行时禁止调整更新间隔
         self.update_interval_action.setEnabled(False)
+        # 运行时禁止设置单位和阈值
+        self.set_units_action.setEnabled(False)
+        self.set_limit_action.setEnabled(False)
 
         # 禁用模式切换
         self.mode_serial_action.setEnabled(False)
@@ -1018,6 +1056,9 @@ class RealTimePlotApp(QMainWindow):
         self.single_mode_action.setEnabled(True)
         # 停止后允许调整更新间隔
         self.update_interval_action.setEnabled(True)
+        # 停止后允许设置单位和阈值
+        self.set_units_action.setEnabled(True)
+        self.set_limit_action.setEnabled(True)
 
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
@@ -1069,6 +1110,60 @@ class RealTimePlotApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Cannot Open Folder: {str(e)}")
 
+    def set_channel_units(self):
+        """设置两个通道的单位"""
+        if self.run_stat:
+            QMessageBox.warning(self, "Warning", "Cannot change units while monitoring is running!")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Set Channel Units")
+        dialog.setFixedSize(300, 150)
+        
+        layout = QGridLayout()
+        
+        # 通道 1 设置
+        layout.addWidget(QLabel("Channel 1 Unit:"), 0, 0)
+        combo1 = QComboBox()
+        combo1.addItems(["mA", "μA", "nA"])
+        combo1.setCurrentText(self.unit_ch1)
+        layout.addWidget(combo1, 0, 1)
+        
+        # 通道 2 设置
+        layout.addWidget(QLabel("Channel 2 Unit:"), 1, 0)
+        combo2 = QComboBox()
+        combo2.addItems(["mA", "μA", "nA"])
+        combo2.setCurrentText(self.unit_ch2)
+        layout.addWidget(combo2, 1, 1)
+        
+        # 按钮
+        btn_box = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_box.addWidget(ok_btn)
+        btn_box.addWidget(cancel_btn)
+        layout.addLayout(btn_box, 2, 0, 1, 2)
+        
+        dialog.setLayout(layout)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            self.unit_ch1 = combo1.currentText()
+            self.unit_ch2 = combo2.currentText()
+            
+            # 更新 UI 上的标签
+            self.current1_label.setText(f"Channel 1 Current: --- {self.unit_ch1}")
+            if not self.single_channel_mode:
+                self.current2_label.setText(f"Channel 2 Current: --- {self.unit_ch2}")
+            
+            # 更新绘图轴标签
+            self.ax.set_ylabel(f'Channel 1 Current ({self.unit_ch1})', color='#1f77b4', fontweight='bold')
+            self.ax2.set_ylabel(f'Channel 2 Current ({self.unit_ch2})', color='#ff7f0e', fontweight='bold')
+            self.canvas.draw()
+            
+            print(f"Units set to: Ch1={self.unit_ch1}, Ch2={self.unit_ch2}")
+
     def set_update_interval(self):
         """设置更新间隔对话框"""
         # 获取当前更新间隔
@@ -1111,6 +1206,84 @@ class RealTimePlotApp(QMainWindow):
                 )
             
             print(f"Update interval changed to: {interval}ms")
+
+    def set_current_threshold(self):
+        """设置电流过滤阈值对话框"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Set Current Threshold (Filter)")
+        dialog.setFixedSize(350, 180)
+        
+        layout = QGridLayout()
+        
+        # --- 通道 1 设置 ---
+        layout.addWidget(QLabel("Channel 1 Max Limit:"), 0, 0)
+        
+        # 数值输入框
+        spin1 = QtWidgets.QDoubleSpinBox()
+        spin1.setRange(0, 999999) # 设置范围
+        spin1.setDecimals(4)      # 设置小数位
+        spin1.setValue(self.limit_ch1_ma) # 默认显示当前的mA值
+        layout.addWidget(spin1, 0, 1)
+        
+        # 单位选择框
+        combo1 = QComboBox()
+        combo1.addItems(["mA", "μA", "nA"])
+        combo1.setCurrentText("mA") # 默认显示单位为mA，因为spinbox里填的是mA值
+        layout.addWidget(combo1, 0, 2)
+        
+        # --- 通道 2 设置 ---
+        layout.addWidget(QLabel("Channel 2 Max Limit:"), 1, 0)
+        
+        # 数值输入框
+        spin2 = QtWidgets.QDoubleSpinBox()
+        spin2.setRange(0, 999999)
+        spin2.setDecimals(4)
+        spin2.setValue(self.limit_ch2_ma)
+        layout.addWidget(spin2, 1, 1)
+        
+        # 单位选择框
+        combo2 = QComboBox()
+        combo2.addItems(["mA", "μA", "nA"])
+        combo2.setCurrentText("mA")
+        layout.addWidget(combo2, 1, 2)
+        
+        # 说明标签
+        note_label = QLabel("Note: Signals exceeding this value will be ignored.")
+        note_label.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addWidget(note_label, 2, 0, 1, 3)
+
+        # --- 按钮区域 ---
+        btn_box = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_box.addWidget(ok_btn)
+        btn_box.addWidget(cancel_btn)
+        layout.addLayout(btn_box, 3, 0, 1, 3)
+        
+        dialog.setLayout(layout)
+        
+        # 如果用户点击了OK
+        if dialog.exec_() == QDialog.Accepted:
+            # 计算并保存通道1阈值 (转换为 mA)
+            val1 = spin1.value()
+            unit1 = combo1.currentText()
+            self.limit_ch1_ma = val1 * self.unit_factors[unit1]
+            
+            # 计算并保存通道2阈值 (转换为 mA)
+            val2 = spin2.value()
+            unit2 = combo2.currentText()
+            self.limit_ch2_ma = val2 * self.unit_factors[unit2]
+            
+            print(f"Thresholds Updated: Ch1={self.limit_ch1_ma} mA, Ch2={self.limit_ch2_ma} mA")
+            
+            # 状态栏反馈
+            QMessageBox.information(self, "Updated", 
+                                  f"Filter Thresholds Set:\n"
+                                  f"Ch1: {self.limit_ch1_ma} mA\n"
+                                  f"Ch2: {self.limit_ch2_ma} mA")
+
 
     def toggle_pulse_reminder(self):
         """切换脉冲提醒开关"""
@@ -1191,13 +1364,25 @@ class RealTimePlotApp(QMainWindow):
 
     def setup_mouse_hover(self):
         """设置鼠标悬停功能"""
-        # 创建注释文本框
-        self.hover_annotation = self.ax.annotate(
+        # 为通道 1 创建注释 (绑定到 ax，蓝色背景)
+        self.hover_annotation1 = self.ax.annotate(
             '', 
             xy=(0, 0), 
             xytext=(20, 20), 
             textcoords="offset points",
-            bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.8),
+            bbox=dict(boxstyle="round,pad=0.5", fc="lightblue", alpha=0.8),
+            arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0"),
+            fontsize=10,
+            visible=False
+        )
+        
+        # 为通道 2 创建注释 (绑定到 ax2，橙色背景)
+        self.hover_annotation2 = self.ax2.annotate(
+            '', 
+            xy=(0, 0), 
+            xytext=(20, 20), 
+            textcoords="offset points",
+            bbox=dict(boxstyle="round,pad=0.5", fc="#ffcc99", alpha=0.8),
             arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0"),
             fontsize=10,
             visible=False
@@ -1208,29 +1393,22 @@ class RealTimePlotApp(QMainWindow):
 
     def on_hover(self, event):
         """鼠标悬停事件处理"""
-        # 只检查鼠标是否在图表区域内，不检查运行状态
-        if event.inaxes != self.ax:
-            self.hover_annotation.set_visible(False)
+        # 检查鼠标是否在任意一个轴内 (ax 或 ax2)
+        if event.inaxes not in [self.ax, self.ax2]:
+            self.hover_annotation1.set_visible(False)
+            self.hover_annotation2.set_visible(False)
             self.canvas.draw_idle()
             return
         
-        # 检查是否有有效数据（可选的额外检查）
+        # 检查是否有有效数据
         if not hasattr(self, 'time_data') or len(self.time_data) == 0:
-            self.hover_annotation.set_visible(False)
+            self.hover_annotation1.set_visible(False)
+            self.hover_annotation2.set_visible(False)
             self.canvas.draw_idle()
             return
         
-        # 获取鼠标位置
-        x_mouse = event.xdata
-        y_mouse = event.ydata
-        
-        if x_mouse is None or y_mouse is None:
-            self.hover_annotation.set_visible(False)
-            self.canvas.draw_idle()
-            return
-        
-        # 找到最接近的数据点
-        closest_point = self.find_closest_point(x_mouse, y_mouse)
+        # 找到最接近的数据点 (传入 event 对象以处理坐标转换)
+        closest_point = self.find_closest_point(event)
         
         if closest_point:
             channel, index, x_val, y_val, time_val = closest_point
@@ -1242,65 +1420,84 @@ class RealTimePlotApp(QMainWindow):
             else:
                 time_str = "N/A"
             
+            # 获取当前通道的单位
+            unit = self.unit_ch1 if channel == 1 else self.unit_ch2
+            
             # 创建显示文本
-            hover_text = f"Channel {channel}\nTime: {time_str}\nCurrent: {y_val:.4f} mA"
+            hover_text = f"Channel {channel}\nTime: {time_str}\nCurrent: {y_val:.4f} {unit}"
             
-            # 更新注释
-            self.hover_annotation.xy = (x_val, y_val)
-            self.hover_annotation.set_text(hover_text)
-            self.hover_annotation.set_visible(True)
-            
-            # 设置不同通道的颜色
+            # 根据通道显示对应的注释框，并隐藏另一个
             if channel == 1:
-                self.hover_annotation.get_bbox_patch().set_facecolor('lightblue')
+                self.hover_annotation1.xy = (x_val, y_val)
+                self.hover_annotation1.set_text(hover_text)
+                self.hover_annotation1.set_visible(True)
+                self.hover_annotation2.set_visible(False)
             else:
-                self.hover_annotation.get_bbox_patch().set_facecolor('lightcoral')
+                self.hover_annotation2.xy = (x_val, y_val)
+                self.hover_annotation2.set_text(hover_text)
+                self.hover_annotation2.set_visible(True)
+                self.hover_annotation1.set_visible(False)
         else:
-            self.hover_annotation.set_visible(False)
+            self.hover_annotation1.set_visible(False)
+            self.hover_annotation2.set_visible(False)
         
         self.canvas.draw_idle()
 
-    def find_closest_point(self, x_mouse, y_mouse):
+    def find_closest_point(self, event):
         """找到最接近鼠标位置的数据点"""
         min_distance = float('inf')
         closest_point = None
         
-        # 检查通道1的数据点
-        for i in range(len(self.x_data)):
-            x_data_point = self.x_data[i]
-            y_data_point = self.y_data1[i]
-            
-            # 计算距离（考虑坐标轴的比例）
-            x_range = self.ax.get_xlim()[1] - self.ax.get_xlim()[0]
-            y_range = self.ax.get_ylim()[1] - self.ax.get_ylim()[0]
-            
-            # 归一化距离计算
-            dx = (x_mouse - x_data_point) / x_range
-            dy = (y_mouse - y_data_point) / y_range
-            distance = (dx**2 + dy**2)**0.5
-            
-            if distance < min_distance and distance < 0.05:  # 设置敏感度阈值
-                min_distance = distance
-                time_val = self.time_data[i] if hasattr(self, 'time_data') and i < len(self.time_data) else 0
-                closest_point = (1, i, x_data_point, y_data_point, time_val)
+        # 获取鼠标在两个轴坐标系下的数据坐标
+        # 注意：event.x 和 event.y 是屏幕像素坐标，我们需要将其分别转换回两个轴的数据坐标
+        try:
+            x1, y1 = self.ax.transData.inverted().transform((event.x, event.y))
+            x2, y2 = self.ax2.transData.inverted().transform((event.x, event.y))
+        except Exception:
+            return None
         
-        # 检查通道2的数据点
-        for i in range(len(self.x_data)):
-            x_data_point = self.x_data[i]
-            y_data_point = self.y_data2[i]
+        # --- 检查通道 1 的数据点 (使用 ax 的坐标系) ---
+        xlim1 = self.ax.get_xlim()
+        ylim1 = self.ax.get_ylim()
+        x_range1 = xlim1[1] - xlim1[0]
+        y_range1 = ylim1[1] - ylim1[0]
+        
+        if x_range1 > 0 and y_range1 > 0:
+            for i in range(len(self.x_data)):
+                x_data_point = self.x_data[i]
+                y_data_point = self.y_data1[i]
+                
+                # 归一化距离计算 (使用 x1, y1)
+                dx = (x1 - x_data_point) / x_range1
+                dy = (y1 - y_data_point) / y_range1
+                distance = (dx**2 + dy**2)**0.5
+                
+                if distance < min_distance and distance < 0.05:  # 阈值
+                    min_distance = distance
+                    time_val = self.time_data[i] if hasattr(self, 'time_data') and i < len(self.time_data) else 0
+                    closest_point = (1, i, x_data_point, y_data_point, time_val)
+        
+        # --- 检查通道 2 的数据点 (使用 ax2 的坐标系) ---
+        if not self.single_channel_mode:
+            xlim2 = self.ax2.get_xlim()
+            ylim2 = self.ax2.get_ylim()
+            x_range2 = xlim2[1] - xlim2[0]
+            y_range2 = ylim2[1] - ylim2[0]
             
-            # 计算距离
-            x_range = self.ax.get_xlim()[1] - self.ax.get_xlim()[0]
-            y_range = self.ax.get_ylim()[1] - self.ax.get_ylim()[0]
-            
-            dx = (x_mouse - x_data_point) / x_range
-            dy = (y_mouse - y_data_point) / y_range
-            distance = (dx**2 + dy**2)**0.5
-            
-            if distance < min_distance and distance < 0.05:
-                min_distance = distance
-                time_val = self.time_data[i] if hasattr(self, 'time_data') and i < len(self.time_data) else 0
-                closest_point = (2, i, x_data_point, y_data_point, time_val)
+            if x_range2 > 0 and y_range2 > 0:
+                for i in range(len(self.x_data)):
+                    x_data_point = self.x_data[i]
+                    y_data_point = self.y_data2[i]
+                    
+                    # 归一化距离计算 (使用 x2, y2)
+                    dx = (x2 - x_data_point) / x_range2
+                    dy = (y2 - y_data_point) / y_range2
+                    distance = (dx**2 + dy**2)**0.5
+                    
+                    if distance < min_distance and distance < 0.05:
+                        min_distance = distance
+                        time_val = self.time_data[i] if hasattr(self, 'time_data') and i < len(self.time_data) else 0
+                        closest_point = (2, i, x_data_point, y_data_point, time_val)
         
         return closest_point
 
@@ -1465,25 +1662,25 @@ class RealTimePlotApp(QMainWindow):
         """关闭事件，确保资源被正确释放"""
         self.stop_monitoring()
         event.accept()
-    
+
     def update_data(self):
-        """定时更新数据 - 支持单/双通道"""
+        """定时更新数据 - 支持单/双通道、多单位转换及双轴绘图"""
         if not self.run_stat:
             return
         
         try:
-            # 发送请求
+            # 1. 发送请求
             self.send_data(1)
             if not self.single_channel_mode:
                 self.send_data(2)
             
-            # 接收数据
+            # 2. 接收数据 (这里获取的是对应单位的原始数值)
             current1 = self.recv_data(1)
             
             if not self.single_channel_mode:
                 current2 = self.recv_data(2)
             else:
-                current2 = 0.0  # 单通道模式下，通道2数据强制为0
+                current2 = 0.0
             
             # 检查数据有效性
             if current1 is None:
@@ -1491,54 +1688,55 @@ class RealTimePlotApp(QMainWindow):
             if not self.single_channel_mode and current2 is None:
                 return
             
-            # 检查电流值是否有效
-            if current1 > 1000 or current2 > 1000:
-                print(f"Invalid Current Values: Ch1={current1} mA, Ch2={current2} mA, Skipping Calculation")
+            # 3. 数据转换：将原始读数转换为 mA，用于积分计算和文件保存
+            factor1 = self.unit_factors[self.unit_ch1]
+            current1_ma = current1 * factor1
+            
+            if not self.single_channel_mode:
+                factor2 = self.unit_factors[self.unit_ch2]
+                current2_ma = current2 * factor2
+            else:
+                current2_ma = 0.0
+            
+            # 简单过滤：如果转换后的 mA 值大得离谱(>1000mA)，可能是干扰
+            if current1_ma > self.limit_ch1_ma or current2_ma > self.limit_ch2_ma:
+                print(f"Invalid Current (mA converted): Ch1={current1_ma}, Ch2={current2_ma}, Skipping")
                 return
             
             # 获取当前时间
             now = self.get_time()
-            
-            # 获取本地时间和UTC时间
             local_time = time.localtime(now)
             utc_time = time.gmtime(now)
-            
             local_time_str = time.strftime("%Y-%m-%d %H:%M:%S (UTC%z)", local_time)
             utc_time_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", utc_time)
             
-            # 优化积分计算：使用梯形法则
+            # 4. 积分计算 (必须使用 mA 值，确保积分单位是 mC)
             if self.last_time is not None:
                 delta_t = now - self.last_time
                 
-                if delta_t <= 0:
-                    print(f"Invalid Time Interval: {delta_t}, Skipping Calculation")
-                    return
-                
-                # 通道1积分计算
-                if self.last_current1 is not None:
-                    avg_current1 = Decimal(str((self.last_current1 + current1) / 2.0))
-                    charge_segment1 = avg_current1 * Decimal(str(delta_t))
-                    self.column_int1 += charge_segment1
-                else:
-                    charge_segment1 = Decimal(str(current1)) * Decimal(str(delta_t))
-                    self.column_int1 += charge_segment1
-                
-                # 通道2积分计算仅在双通道模式下进行
-                if not self.single_channel_mode:
-                    if self.last_current2 is not None:
-                        avg_current2 = Decimal(str((self.last_current2 + current2) / 2.0))
-                        charge_segment2 = avg_current2 * Decimal(str(delta_t))
-                        self.column_int2 += charge_segment2
+                if delta_t > 0:
+                    # 通道1积分
+                    if self.last_current1 is not None:
+                        # self.last_current1 存储的是上一次的 mA 值
+                        avg_current1 = Decimal(str((self.last_current1 + current1_ma) / 2.0))
+                        self.column_int1 += avg_current1 * Decimal(str(delta_t))
                     else:
-                        charge_segment2 = Decimal(str(current2)) * Decimal(str(delta_t))
-                        self.column_int2 += charge_segment2
+                        self.column_int1 += Decimal(str(current1_ma)) * Decimal(str(delta_t))
+                    
+                    # 通道2积分
+                    if not self.single_channel_mode:
+                        if self.last_current2 is not None:
+                            avg_current2 = Decimal(str((self.last_current2 + current2_ma) / 2.0))
+                            self.column_int2 += avg_current2 * Decimal(str(delta_t))
+                        else:
+                            self.column_int2 += Decimal(str(current2_ma)) * Decimal(str(delta_t))
             
-            # 保存当前电流值用于下次计算
-            self.last_current1 = current1
-            self.last_current2 = current2
+            # 保存当前的 mA 值用于下次积分计算
+            self.last_current1 = current1_ma
+            self.last_current2 = current2_ma
             self.last_time = now
             
-            # 更新显示标签
+            # 5. 更新 UI 显示 (显示原始数值 + 当前单位)
             runtime = now - self.start_time
             h = int(runtime // 3600)
             m = int((runtime - h * 3600) // 60)
@@ -1547,27 +1745,25 @@ class RealTimePlotApp(QMainWindow):
             integral1_float = float(self.column_int1)
             integral2_float = float(self.column_int2)
             
-            self.current1_label.setText(f"Channel 1 Current: {current1:.4f} mA")
+            self.current1_label.setText(f"Channel 1 Current: {current1:.4f} {self.unit_ch1}")
             
-            # UI显示逻辑
             if self.single_channel_mode:
-                self.current2_label.setText("Channel 2 Current: --- mA")
-                # 积分值保持显示数值(0或之前的值)
+                self.current2_label.setText("Channel 2 Current: --- (Disabled)")
             else:
-                self.current2_label.setText(f"Channel 2 Current: {current2:.4f} mA")
+                self.current2_label.setText(f"Channel 2 Current: {current2:.4f} {self.unit_ch2}")
 
             self.runtime_label.setText(f"Run Time: {h:02d} Hours {m:02d} Minutes {s:05.2f} Seconds")
-            self.integral1_label.setText(f"Channel 1 Integral: {integral1_float:.4f} mC")
-            self.integral2_label.setText(f"Channel 2 Integral: {integral2_float:.4f} mC")
+            self.integral1_label.setText(f"Channel 1 Integral: {integral1_float:.4e} mC")
+            self.integral2_label.setText(f"Channel 2 Integral: {integral2_float:.4e} mC")
             self.timestamp_label.setText(f"Last Update Time (Local): {local_time_str}")
             self.utc_timestamp_label.setText(f"UTC Timestamp: {utc_time_str}")
             
-            # 更新绘图数据
+            # 6. 更新绘图数据 (使用原始数值，因为是双纵轴，各自显示各自的单位数值)
             self.y_data1 = np.roll(self.y_data1, -1)
             self.y_data1[-1] = current1
             
             self.y_data2 = np.roll(self.y_data2, -1)
-            self.y_data2[-1] = current2 # 单通道模式下这里是0
+            self.y_data2[-1] = current2
             
             self.time_data = np.roll(self.time_data, -1)
             self.time_data[-1] = now
@@ -1576,10 +1772,11 @@ class RealTimePlotApp(QMainWindow):
             self.line1.set_ydata(self.y_data1)
             self.line2.set_ydata(self.y_data2)
             
-            # 控制第二条线的可见性
+            # 控制可见性
             self.line2.set_visible(not self.single_channel_mode)
+            self.ax2.set_visible(not self.single_channel_mode)
             
-            # 更新X轴标签为运行时间
+            # 更新X轴标签
             x_labels = []
             for i in range(len(self.x_data)):
                 time_sec = (self.time_data[i] - self.start_time) if self.time_data[i] > 0 else 0
@@ -1589,28 +1786,38 @@ class RealTimePlotApp(QMainWindow):
             self.ax.set_xticks(tick_indices)
             self.ax.set_xticklabels([x_labels[i] for i in tick_indices])
             
-            # 自动调整Y轴范围
-            if self.single_channel_mode:
-                all_data = self.y_data1 # 只看通道1
-            else:
-                all_data = np.concatenate([self.y_data1, self.y_data2])
-
-            min_val = max(-1, min(all_data) - 0.1)
-            max_val = min(10, max(all_data) + 0.1)
-            self.ax.set_ylim(min_val, max_val)
+            # 7. 自动调整 Y 轴范围 (双轴独立调整)
+            # 调整左轴 (Channel 1)
+            min_y1 = np.min(self.y_data1)
+            max_y1 = np.max(self.y_data1)
+            # 增加 10% 的上下边距，避免曲线顶格
+            margin1 = (max_y1 - min_y1) * 0.1 if max_y1 != min_y1 else max(0.1, abs(max_y1)*0.1)
+            # 假设电流通常为正，下限设为0或更低；如果可能有负电流，则自适应
+            lower_bound1 = min(0, min_y1 - margin1) if min_y1 >= 0 else min_y1 - margin1
+            self.ax.set_ylim(lower_bound1, max_y1 + margin1)
             
-            # 重绘图形
+            # 调整右轴 (Channel 2)
+            if not self.single_channel_mode:
+                min_y2 = np.min(self.y_data2)
+                max_y2 = np.max(self.y_data2)
+                margin2 = (max_y2 - min_y2) * 0.1 if max_y2 != min_y2 else max(0.1, abs(max_y2)*0.1)
+                lower_bound2 = min(0, min_y2 - margin2) if min_y2 >= 0 else min_y2 - margin2
+                self.ax2.set_ylim(lower_bound2, max_y2 + margin2)
+            
+            # 重绘
             self.canvas.draw()
             
-            # 写入数据到文件 (current2 在单通道模式下已设为0)
-            self.write_data_row(now, runtime, current1, current2, integral1_float, integral2_float)
+            # 8. 写入文件 (传入转换后的 mA 值，write_data_row 内部需使用 .8e 格式)
+            self.write_data_row(now, runtime, current1_ma, current2_ma, integral1_float, integral2_float)
             
-            # 打印到控制台
-            print(f"Ch1: {current1:.4f} mA, Ch2: {current2:.4f} mA, Runtime: {runtime:.4f} s, "
-                  f"Int1: {integral1_float:.4f} mC, Int2: {integral2_float:.4f} mC, UTC: {utc_time_str}")
+            # 打印日志
+            print(f"Ch1: {current1:.4f} {self.unit_ch1}, Ch2: {current2:.4f} {self.unit_ch2}, "
+                  f"Int1: {integral1_float:.4f} mC, Int2: {integral2_float:.4f} mC")
             
         except Exception as e:
             print(f"Error Updating Data: {e}")
+            import traceback
+            traceback.print_exc()
 
 def main():
     app = QApplication(sys.argv)
@@ -1641,3 +1848,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
