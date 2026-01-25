@@ -1787,23 +1787,33 @@ class RealTimePlotApp(QMainWindow):
             self.ax.set_xticklabels([x_labels[i] for i in tick_indices])
             
             # 7. 自动调整 Y 轴范围 (双轴独立调整)
-            # 调整左轴 (Channel 1)
+            # --- 调整左轴 (Channel 1) ---
             min_y1 = np.min(self.y_data1)
             max_y1 = np.max(self.y_data1)
-            # 增加 10% 的上下边距，避免曲线顶格
-            margin1 = (max_y1 - min_y1) * 0.1 if max_y1 != min_y1 else max(0.1, abs(max_y1)*0.1)
-            # 假设电流通常为正，下限设为0或更低；如果可能有负电流，则自适应
-            lower_bound1 = min(0, min_y1 - margin1) if min_y1 >= 0 else min_y1 - margin1
-            self.ax.set_ylim(lower_bound1, max_y1 + margin1)
+            range_y1 = max_y1 - min_y1
+
+            if range_y1 == 0:
+                # 如果是直线（数值不变），上下各留 25% 的绝对值空间，或者默认 0.1
+                margin1 = max(0.1, abs(max_y1) * 0.25)
+            else:
+                # 如果有波动，上下各留波动幅度的 25%
+                margin1 = range_y1 * 0.25
+
+            self.ax.set_ylim(min_y1 - margin1, max_y1 + margin1)
             
-            # 调整右轴 (Channel 2)
+            # --- 调整右轴 (Channel 2) ---
             if not self.single_channel_mode:
                 min_y2 = np.min(self.y_data2)
                 max_y2 = np.max(self.y_data2)
-                margin2 = (max_y2 - min_y2) * 0.1 if max_y2 != min_y2 else max(0.1, abs(max_y2)*0.1)
-                lower_bound2 = min(0, min_y2 - margin2) if min_y2 >= 0 else min_y2 - margin2
-                self.ax2.set_ylim(lower_bound2, max_y2 + margin2)
-            
+                range_y2 = max_y2 - min_y2
+
+                if range_y2 == 0:
+                    margin2 = max(0.1, abs(max_y2) * 0.25)
+                else:
+                    margin2 = range_y2 * 0.25
+
+                self.ax2.set_ylim(min_y2 - margin2, max_y2 + margin2)    
+
             # 重绘
             self.canvas.draw()
             
@@ -1848,4 +1858,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
