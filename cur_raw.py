@@ -242,6 +242,13 @@ class RealTimePlotApp(QMainWindow):
         # 鼠标悬停相关属性
         self.hover_annotation = None       
 
+        # --- DAQ 监控初始化 ---
+        self.daq_status_file = "/tmp/daq_status.txt"
+        self.daq_last_mtime = 0
+        self.daq_timer = QTimer()
+        self.daq_timer.timeout.connect(self.check_daq_status)
+        self.daq_timer.setInterval(200)  # 每200ms检查一次文件
+
         # 然后创建UI和菜单栏
         self.init_ui()
         self.create_menu_bar()
@@ -336,6 +343,16 @@ class RealTimePlotApp(QMainWindow):
         self.pulse_reminder_action.setToolTip("Enable/Disable Pulse Reminder")
         run_menu.addAction(self.pulse_reminder_action)
 
+        # run_menu.addSeparator()
+
+        # --- [新增代码开始] DAQ 连接选项 ---
+        self.daq_connect_action = QtWidgets.QAction('Connect to DAQ (beta)', self)
+        self.daq_connect_action.setCheckable(True)
+        self.daq_connect_action.setChecked(False)
+        self.daq_connect_action.triggered.connect(self.toggle_daq_connection)
+        self.daq_connect_action.setToolTip("Sync Start/Stop and Filename with DAQ System")
+        run_menu.addAction(self.daq_connect_action)        
+
         run_menu.addSeparator()
 
         # 设置通道单位菜单项
@@ -391,6 +408,111 @@ class RealTimePlotApp(QMainWindow):
             self.current2_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #ff7f0e;")
             
         print(f"Mode Switched: {'Single Channel' if self.single_channel_mode else 'Dual Channel'}")
+
+    #  DAQ 联动功能实现
+    def toggle_daq_connection(self):
+        """切换 DAQ 连接模式"""
+        is_connected = self.daq_connect_action.isChecked()
+        
+        if is_connected:
+            # 开启模式：锁定文件名输入，初始化时间戳，启动定时器
+            self.filename_input.setEnabled(False)
+            self.browse_button.setEnabled(False)
+            self.file_mode_combo.setEnabled(False)
+            
+            # 初始化 last_mtime，忽略开启前的旧状态（参考你的 monitor_daq 逻辑）
+            if os.path.exists(self.daq_status_file):
+                try:
+                    self.daq_last_mtime = os.path.getmtime(self.daq_status_file)
+                except OSError:
+                    self.daq_last_mtime = 0
+            
+            self.daq_timer.start()
+            print("DAQ Connection Enabled: Monitoring started.")
+            self.save_status_label.setText("DAQ Mode: Waiting for signal...")
+            self.save_status_label.setStyleSheet("color: blue;")
+        else:
+            # 关闭模式：停止定时器，恢复输入框
+            self.daq_timer.stop()
+            self.filename_input.setEnabled(True)
+            self.browse_button.setEnabled(True)
+            self.file_mode_combo.setEnabled(True)
+            print("DAQ Connection Disabled.")
+            self.save_status_label.setText("DAQ Mode: Disabled")
+            self.save_status_label.setStyleSheet("color: black;")
+
+    def check_daq_status(self):
+        """定时检查 DAQ 状态文件"""
+        if not os.path.exists(self.daq_status_file):
+            return
+
+        try:
+            current_mtime = os.path.getmtime(self.daq_status_file)
+            
+            # 只有文件被修改过才读取
+            if current_mtime > self.daq_last_mtime:
+                self.daq_last_mtime = current_mtime
+                
+                # 读取文件内容
+                with open(self.daq_status_file, 'r') as f:
+                    lines = [line.strip() for line in f.readlines()]
+                
+                if not lines:
+                    return
+
+                status_line = lines[0]
+
+                if "STATUS: RUNNING" in status_line:
+                    # 如果已经在运行，先不处理，或者可以选择重启监控
+                    if self.run_stat:
+                        print("DAQ Signal: START received, but already running. Ignoring.")
+                        return
+
+                    if len(lines) >= 4:
+                        run_name = lines[1]
+                        try:
+                            run_num = int(lines[2])
+                        except ValueError:
+                            run_num = 0
+                        data_path = lines[3]
+
+                        # 1. 确定保存路径：data_path 的上一级 + current_data
+                        parent_dir = os.path.dirname(data_path)
+                        save_dir = os.path.join(parent_dir, "current_data")
+                        
+                        # 创建文件夹
+                        if not os.path.exists(save_dir):
+                            try:
+                                os.makedirs(save_dir, exist_ok=True)
+                            except Exception as e:
+                                print(f"Error creating directory: {e}")
+                                return
+
+                        # 2. 确定文件名：运行名称_运行编号 (5位)
+                        # 例如: run_00048.csv
+                        filename = f"{run_name}_{run_num:05d}.csv"
+                        full_path = os.path.join(save_dir, filename)
+
+                        # 3. 更新 UI 并启动
+                        self.filename_input.setText(full_path)
+                        print(f"DAQ Signal: START. File: {full_path}")
+                        
+                        # 确保使用覆盖模式或追加模式，这里默认追加即可，因为是新文件
+                        self.start_monitoring()
+                        
+                        # 更新状态提示
+                        self.save_status_label.setText(f"DAQ Linked: Running {filename}")
+                        self.save_status_label.setStyleSheet("color: green;")
+
+                elif "STATUS: STOPPED" in status_line:
+                    if self.run_stat:
+                        print("DAQ Signal: STOP received.")
+                        self.stop_monitoring()
+                        self.save_status_label.setText("DAQ Linked: Stopped")
+                        self.save_status_label.setStyleSheet("color: orange;")
+
+        except Exception as e:
+            print(f"Error checking DAQ status: {e}")
 
     def init_ui(self):
         # 主布局

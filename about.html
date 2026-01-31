@@ -1,7 +1,7 @@
 <div style="font-family: Arial, sans-serif; line-height: 1.6;">
 <center>
 <h2 style="color: #2E86AB; margin-bottom: 10px;">Real-Time Current Monitoring System</h2>
-<p><b>Version 2026.01.25</b></p>
+<p><b>Version 2026.01.28</b></p>
 <p>Compatible with 創鴻高精度智能盤面表 DM4D-An-Rs</p>
 <p><b>Developer:</b> Zhicheng Zhang</p>
 <p><b>Email:</b> <a href="mailto:zhangzhicheng@cnncmail.cn">zhangzhicheng@cnncmail.cn</a></p>
@@ -28,7 +28,15 @@
 
 
 <div style="margin-left: 15px;">
-<h4 style="color: #4A90E2; margin-bottom: 5px;"> 2026-01-25 (Latest)</h4>
+
+<h4 style="color: #4A90E2; margin-bottom: 5px;"> 2026-01-28 (Latest)</h4>
+<ul style="margin-top: 5px; margin-bottom: 15px;">
+    <li>DAQ Integration (Beta): Added "Connect to DAQ" in Run menu. The system now monitors <code>/tmp/daq_status.txt</code> to automatically sync start/stop actions with the DAQ program.</li>
+    <li>Automated File Management: When DAQ mode is enabled, the save path and filename are automatically generated based on the DAQ run name and number, stored in a parallel <code>current_data</code> directory.</li>
+</ul>
+
+
+<h4 style="color: #4A90E2; margin-bottom: 5px;"> 2026-01-25</h4>
 <ul style="margin-top: 5px; margin-bottom: 15px;">
     <li>Multi-Unit Support: Added "Set Channel Units" in Run menu, allowing independent unit selection (mA, μA, nA) for each channel.</li>
     <li>Dual Y-Axis Visualization: Upgraded plotting to use twin axes, enabling clear visualization of two channels with vastly different scales.</li>
