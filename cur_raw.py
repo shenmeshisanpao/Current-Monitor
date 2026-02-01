@@ -266,6 +266,7 @@ class StatusMonitor:    # 类: 监控逻辑核心
     def start(self):
         self.is_running = True
         self.history.clear()
+        self.warning_state = "RUN"
 
     def stop(self):
         self.is_running = False
