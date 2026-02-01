@@ -66,8 +66,26 @@ dmesg -w
 
 8. 在菜单栏"Run"-"Set Current Threshold"中可以设置电流阈值，如果读数超过阈值，将被视为无效而不记录。
 
-9. 在菜单栏"Run"-"Connect to DAQ (beta)"中可以与获取程序“DAQ_Master for BNU LAMBDA”联动，实现同步启停，自动命名、保存文件到root文件同目录下的current_data文件夹中。如失效，请确保使用了最新版的“DAQ_Master”获取程序。
+9. 在菜单栏"Run"-"Connect to DAQ (beta)"中可以与获取程序“DAQ_Master for BNU LAMBDA”联动，实现同步启停，自动命名、保存文件到root文件同目录下的current_data文件夹中。如失效，请确保使用了最新版的“DAQ_Master”获取程序。DAQ程序应可以自动修改"/tmp/daq_status.txt"以被读取状态。
+
+10. 在菜单栏"Run"-"Status Monitor Settings"中可对状态框进行设置。
+
+第9点中的`/tmp/daq_status.txt`文件格式如下：
+
+当DAQ停止运行时
+```text
+STATUS: STOPPED
+```
+
+当DAQ正在运行时
+```text
+STATUS: RUNNING
+轮次名（一般为run）
+轮次号（如 180）
+DAQ保存root文件的地址（如 ./12Cag/target1/raw）
+```
+
+
 
 ---
 
-​

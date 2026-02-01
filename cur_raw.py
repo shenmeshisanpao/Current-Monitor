@@ -37,6 +37,7 @@ from PyQt5.QtCore import (QTimer, QUrl)
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib import rcParams
+from collections import deque
 
 # 文件锁
 if os.name == 'nt':  # Windows
@@ -159,7 +160,328 @@ class SingleInstanceLock:
             finally:
                 self.lock_file = None
 
-class RealTimePlotApp(QMainWindow):
+class ClickableLabel(QLabel):   # 类: 可点击的标签 (带闪烁功能)
+    clicked = QtCore.pyqtSignal()
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setAlignment(QtCore.Qt.AlignCenter)
+        
+        # 基础样式
+        self.base_style = "border: 1px solid #555; border-radius: 4px; font-weight: bold; qproperty-alignment: AlignCenter;"
+        # 默认（灭灯/背景）样式
+        self.default_css = "background-color: #E0E0E0; color: #555;" 
+        
+        self.setStyleSheet(self.base_style + self.default_css)
+        
+        # 闪烁定时器
+        self.blink_timer = QTimer(self)
+        self.blink_timer.timeout.connect(self.toggle_color)
+        self.blink_timer.setInterval(200) # 闪烁间隔 200ms
+        
+        self.blink_state = False # True=亮色, False=暗色
+        self.current_css = ""    # 当前应该显示的警告颜色
+        self.last_status = ""    # 记录上一次的状态，防止重复重置定时器
+
+    def mousePressEvent(self, event):
+        self.clicked.emit()
+        super().mousePressEvent(event)
+
+    def set_status(self, status, text=None):
+        """根据状态改变颜色和文字，处理闪烁逻辑"""
+        if text is None:
+            text = status
+        self.setText(text)
+        
+        # 如果状态没有变，且处于闪烁模式中，就不要打断定时器，直接返回
+        if status == self.last_status:
+            return
+        
+        self.last_status = status
+        
+        # 颜色定义
+        style_map = {
+            "STOP": "background-color: #9E9E9E; color: #FFFFFF;", # 灰色
+            "RUN":  "background-color: #4CAF50; color: #FFFFFF;", # 绿色
+            "PEAK": "background-color: #F44336; color: #FFFFFF;", # 红色
+            "DROP": "background-color: #FF9800; color: #FFFFFF;", # 橙色
+            "ZERO": "background-color: #D32F2F; color: #FFFFFF; border: 2px solid red;", # 深红
+            "INIT": "background-color: #B0BEC5; color: #FFFFFF;"  # 浅灰
+        }
+        
+        # 定义哪些状态需要闪烁
+        blinking_states = ["PEAK", "DROP", "ZERO"]
+        
+        target_css = style_map.get(status, style_map["STOP"])
+        
+        if status in blinking_states:
+            # 启动闪烁
+            self.current_css = target_css
+            if not self.blink_timer.isActive():
+                self.blink_state = True
+                self.setStyleSheet(self.base_style + self.current_css) # 立即亮起
+                self.blink_timer.start()
+        else:
+            # 停止闪烁，显示常亮颜色
+            self.blink_timer.stop()
+            self.setStyleSheet(self.base_style + target_css)
+
+    def toggle_color(self):
+        """定时器回调：切换颜色"""
+        self.blink_state = not self.blink_state
+        if self.blink_state:
+            # 亮状态：显示警告色
+            self.setStyleSheet(self.base_style + self.current_css)
+        else:
+            # 灭状态：显示灰色背景 (模拟灯灭)
+            self.setStyleSheet(self.base_style + self.default_css)
+
+class StatusMonitor:    # 类: 监控逻辑核心
+    def __init__(self):
+        self.enabled = True
+        self.history = deque()
+        self.window_seconds = 10.0  # 窗口时间长度
+        self.sample_interval = 0.1  # 采样间隔(s)，会在运行时更新
+        
+        # 阈值设置
+        self.zero_threshold = 0.0001 # 0.1 uA (假设基础单位是mA，这里需要根据实际调整)
+        
+        self.spike_mode = "percent" # "value" or "percent"
+        self.spike_threshold = 0.5 # 0.5 mA
+        self.spike_percent = 50.0  # 20%
+        
+        self.hold_time = 10.0      # 警告保持时间
+       
+        # 内部状态
+        self.warning_state = "RUN" # RUN, PEAK, DROP, ZERO
+        self.warning_end_time = 0
+        self.is_running = False
+
+    def reset(self):
+        self.history.clear()
+        self.warning_state = "RUN"
+        self.warning_end_time = 0
+        self.is_running = False
+
+    def start(self):
+        self.is_running = True
+        self.history.clear()
+
+    def stop(self):
+        self.is_running = False
+        self.warning_state = "STOP"
+
+    def clear_warning(self):
+        """手动清除警告"""
+        self.warning_state = "RUN"
+        self.warning_end_time = 0
+
+    def update_params(self, interval_ms):
+        """更新采样率相关的参数"""
+        self.sample_interval = interval_ms / 1000.0
+        # 重新计算队列最大长度
+        new_maxlen = int(self.window_seconds / self.sample_interval)
+        if new_maxlen < 1: new_maxlen = 1
+        
+        # 如果长度变化，调整deque
+        if self.history.maxlen != new_maxlen:
+            # 创建一个新的deque，保留旧数据
+            new_deque = deque(self.history, maxlen=new_maxlen)
+            self.history = new_deque
+
+    def process(self, current_val):
+        if not self.enabled:
+            return "OFF"
+        if not self.is_running:
+            return "STOP"
+
+        now = time.time()
+        abs_val = abs(current_val)
+
+        # 1. 检查警告是否过期 (如果当前是警告状态)
+        if self.warning_state in ["PEAK", "DROP"]:
+            if now > self.warning_end_time:
+                self.warning_state = "RUN"
+
+        # 2. 零值检测 (优先级最高)
+        if abs_val < self.zero_threshold:
+            self.warning_state = "ZERO"
+            # ZERO 状态通常不需要计时自动消失，或者可以视为一种特殊的DROP
+            # 这里设定为：只要是0就是ZERO，恢复了就变RUN
+            return "ZERO"
+
+        # 3. 填充历史数据
+        # 如果历史数据太少，处于初始化阶段，不报警
+        if len(self.history) < 2:
+            self.history.append(abs_val)
+            return self.warning_state if self.warning_state != "RUN" else "INIT"
+
+        # 计算平均值 (基准线)
+        avg_val = sum(self.history) / len(self.history)
+        diff = abs_val - avg_val
+        
+        triggered = False
+        trigger_type = "RUN"
+
+        # 4. 突变检测
+        if self.spike_mode == "value":
+            if diff > self.spike_threshold:
+                trigger_type = "PEAK"
+                triggered = True
+            elif diff < -self.spike_threshold:
+                trigger_type = "DROP"
+                triggered = True
+        else: # percent mode
+            if avg_val > 1e-9: # 防止分母为0
+                pct = (diff / avg_val) * 100.0
+                if pct > self.spike_percent:
+                    trigger_type = "PEAK"
+                    triggered = True
+                elif pct < -self.spike_percent:
+                    trigger_type = "DROP"
+                    triggered = True
+
+        # 5. 状态更新逻辑
+        if triggered:
+            # 只有当 新警告优先级更高 或 当前没有警告 时才覆盖
+            # 这里简单处理：只要触发就刷新警告状态和计时器
+            self.warning_state = trigger_type
+            self.warning_end_time = now + self.hold_time
+        
+        # 6. 更新历史 (放在判断之后，这样突变点本身在下一帧才会进入平均值，
+        # 从而保证当前帧能检测到差异。如果先append再算平均，突变会被平均值稀释)
+        self.history.append(abs_val)
+
+        return self.warning_state
+
+class MonitorSettingsDialog(QDialog):       #类: 设置对话框
+    def __init__(self, monitor1, monitor2, unit1, unit2, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Status Monitor Settings")
+        self.monitor1 = monitor1
+        self.monitor2 = monitor2
+        self.unit1 = unit1
+        self.unit2 = unit2
+        self.resize(400, 500)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout()
+        
+        # 创建两个标签页分别设置两个通道
+        tab_widget = QtWidgets.QTabWidget()
+        tab_widget.addTab(self.create_channel_tab(self.monitor1, self.unit1), "Channel 1")
+        tab_widget.addTab(self.create_channel_tab(self.monitor2, self.unit2), "Channel 2")
+        layout.addWidget(tab_widget)
+
+        # 底部按钮
+        btn_box = QHBoxLayout()
+        ok_btn = QPushButton("Apply && Close")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_box.addWidget(ok_btn)
+        btn_box.addWidget(cancel_btn)
+        layout.addLayout(btn_box)
+
+        self.setLayout(layout)
+
+    def create_channel_tab(self, monitor, unit):
+        widget = QWidget()
+        form = QtWidgets.QFormLayout()
+
+        # 1. 开关
+        enable_cb = QtWidgets.QCheckBox("Enable Status Monitor")
+        enable_cb.setChecked(monitor.enabled)
+        form.addRow(enable_cb)
+
+        # 2. 历史窗口时间
+        window_spin = QtWidgets.QDoubleSpinBox()
+        window_spin.setRange(1.0, 3600.0)
+        window_spin.setValue(monitor.window_seconds)
+        window_spin.setSuffix(" s")
+        form.addRow("History Window:", window_spin)
+
+        # 3. 零值阈值
+        zero_spin = QtWidgets.QDoubleSpinBox()
+        zero_spin.setRange(0.0, 99999.0)
+        zero_spin.setDecimals(4)
+        zero_spin.setValue(monitor.zero_threshold)
+        zero_spin.setSuffix(f" {unit}")
+        form.addRow("Zero Threshold:", zero_spin)
+
+        form.addRow(QtWidgets.QLabel("--- Warning Logic ---"))
+
+        # 4. 突变阈值模式
+        mode_group = QtWidgets.QButtonGroup(widget) # 需要parent防止垃圾回收
+        radio_val = QtWidgets.QRadioButton(f"By Value ({unit})")
+        radio_pct = QtWidgets.QRadioButton("By Percentage (%)")
+        mode_group.addButton(radio_val)
+        mode_group.addButton(radio_pct)
+        
+        if monitor.spike_mode == "value":
+            radio_val.setChecked(True)
+        else:
+            radio_pct.setChecked(True)
+            
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(radio_val)
+        mode_layout.addWidget(radio_pct)
+        form.addRow("Threshold Mode:", mode_layout)
+
+        # 5. 阈值数值
+        val_spin = QtWidgets.QDoubleSpinBox()
+        val_spin.setRange(0.0, 99999.0)
+        val_spin.setDecimals(4)
+        val_spin.setValue(monitor.spike_threshold)
+        val_spin.setSuffix(f" {unit}")
+        form.addRow("Value Threshold:", val_spin)
+
+        pct_spin = QtWidgets.QDoubleSpinBox()
+        pct_spin.setRange(0.1, 1000.0)
+        pct_spin.setValue(monitor.spike_percent)
+        pct_spin.setSuffix(" %")
+        form.addRow("Percent Threshold:", pct_spin)
+
+        # 6. 警告保持时间
+        hold_spin = QtWidgets.QDoubleSpinBox()
+        hold_spin.setRange(1.0, 300.0)
+        hold_spin.setValue(monitor.hold_time)
+        hold_spin.setSuffix(" s")
+        form.addRow("Warning Hold Time:", hold_spin)
+
+        # 保存引用以便 accept 时读取
+        widget.inputs = {
+            "enable": enable_cb,
+            "window": window_spin,
+            "zero": zero_spin,
+            "mode_val": radio_val,
+            "thresh_val": val_spin,
+            "thresh_pct": pct_spin,
+            "hold": hold_spin
+        }
+        
+        widget.setLayout(form)
+        return widget
+
+    def accept(self):
+        # 应用设置到 monitor 对象
+        for i in range(2):
+            tab = self.layout().itemAt(0).widget().widget(i)
+            monitor = self.monitor1 if i == 0 else self.monitor2
+            inputs = tab.inputs
+            
+            monitor.enabled = inputs["enable"].isChecked()
+            monitor.window_seconds = inputs["window"].value()
+            monitor.zero_threshold = inputs["zero"].value()
+            monitor.spike_mode = "value" if inputs["mode_val"].isChecked() else "percent"
+            monitor.spike_threshold = inputs["thresh_val"].value()
+            monitor.spike_percent = inputs["thresh_pct"].value()
+            monitor.hold_time = inputs["hold"].value()
+            
+        super().accept()
+
+class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
     def __init__(self):
         super().__init__()
         
@@ -242,12 +564,19 @@ class RealTimePlotApp(QMainWindow):
         # 鼠标悬停相关属性
         self.hover_annotation = None       
 
-        # --- DAQ 监控初始化 ---
+        # DAQ 监控初始化
         self.daq_status_file = "/tmp/daq_status.txt"
         self.daq_last_mtime = 0
         self.daq_timer = QTimer()
         self.daq_timer.timeout.connect(self.check_daq_status)
         self.daq_timer.setInterval(200)  # 每200ms检查一次文件
+
+        # 状态监控初始化
+        self.monitor1 = StatusMonitor()
+        self.monitor2 = StatusMonitor()
+        # 初始化参数 (根据默认 update_interval)
+        self.monitor1.update_params(self.update_interval)
+        self.monitor2.update_params(self.update_interval)
 
         # 然后创建UI和菜单栏
         self.init_ui()
@@ -345,7 +674,7 @@ class RealTimePlotApp(QMainWindow):
 
         # run_menu.addSeparator()
 
-        # --- [新增代码开始] DAQ 连接选项 ---
+        # DAQ 连接菜单项
         self.daq_connect_action = QtWidgets.QAction('Connect to DAQ (beta)', self)
         self.daq_connect_action.setCheckable(True)
         self.daq_connect_action.setChecked(False)
@@ -368,6 +697,11 @@ class RealTimePlotApp(QMainWindow):
         self.update_interval_action.triggered.connect(self.set_update_interval)
         self.update_interval_action.setToolTip("Set Data Update Interval")
         run_menu.addAction(self.update_interval_action)
+
+        # 状态监控设置菜单项
+        self.monitor_settings_action = QtWidgets.QAction('Status Monitor Settings', self)
+        self.monitor_settings_action.triggered.connect(self.open_monitor_settings)
+        run_menu.addAction(self.monitor_settings_action)
 
         # 设置电流阈值菜单项
         self.set_limit_action = QtWidgets.QAction('Set Current Threshold', self)
@@ -409,8 +743,7 @@ class RealTimePlotApp(QMainWindow):
             
         print(f"Mode Switched: {'Single Channel' if self.single_channel_mode else 'Dual Channel'}")
 
-    #  DAQ 联动功能实现
-    def toggle_daq_connection(self):
+    def toggle_daq_connection(self):    #  DAQ 联动功能实现
         """切换 DAQ 连接模式"""
         is_connected = self.daq_connect_action.isChecked()
         
@@ -586,7 +919,7 @@ class RealTimePlotApp(QMainWindow):
         # 状态显示区
         status_layout = QGridLayout()
         
-        # 创建标签 - 双通道显示
+        # 双通道显示标签
         self.current1_label = QLabel("Channel 1 Current: --- mA")
         self.current2_label = QLabel("Channel 2 Current: --- mA")
         self.runtime_label = QLabel("Run Time: ---")
@@ -596,6 +929,15 @@ class RealTimePlotApp(QMainWindow):
         self.utc_timestamp_label = QLabel("UTC Timestamp: ---")
         self.save_status_label = QLabel("Save Status: Not Saved")
         
+        # 状态监控标签
+        self.status_label1 = ClickableLabel("STOP")
+        self.status_label1.setFixedSize(80, 50) # 设置合适的大小
+        self.status_label1.clicked.connect(self.monitor1.clear_warning) # 点击清除警告
+        
+        self.status_label2 = ClickableLabel("STOP")
+        self.status_label2.setFixedSize(80, 50)
+        self.status_label2.clicked.connect(self.monitor2.clear_warning)
+
         # 设置标签样式
         for label in [self.current1_label, self.current2_label, self.runtime_label, 
                       self.integral1_label, self.integral2_label, self.timestamp_label, 
@@ -610,11 +952,19 @@ class RealTimePlotApp(QMainWindow):
         self.integral2_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #ff7f0e;")
         
         # 添加到布局
-        status_layout.addWidget(QLabel("Dual-Channel Monitoring Status:"), 0, 0, 1, 2)
+        status_layout.addWidget(QLabel("Dual-Channel Monitoring Status:"), 0, 0, 1, 3)
+        # 第一行：Ch1 Current | Ch1 Status
         status_layout.addWidget(self.current1_label, 1, 0)
         status_layout.addWidget(self.current2_label, 1, 1)
+        # 将状态栏放在第2列 (最右侧)
+        status_layout.addWidget(self.status_label1, 1, 2) 
+        
+        # 第二行：Ch2 Current | Ch2 Status
         status_layout.addWidget(self.integral1_label, 2, 0)
         status_layout.addWidget(self.integral2_label, 2, 1)
+        status_layout.addWidget(self.status_label2, 2, 2)
+        
+        # 其他行保持不变
         status_layout.addWidget(self.runtime_label, 3, 0)
         status_layout.addWidget(self.timestamp_label, 3, 1)
         status_layout.addWidget(self.utc_timestamp_label, 4, 1)
@@ -1127,12 +1477,24 @@ class RealTimePlotApp(QMainWindow):
         if self.pulse_reminder_enabled:
             self.pulse_reminder_timer.start(10 * 1000)  # 10秒后提醒
         
+        # 启动监控逻辑
+        self.monitor1.start()
+        self.monitor2.start()
+        # 更新参数以确保队列长度正确
+        self.monitor1.update_params(self.update_interval)
+        self.monitor2.update_params(self.update_interval)
+
         # 重新启动数据更新定时器
         self.timer.start(self.update_interval)                        
         print("Monitoring Started")
     
     def stop_monitoring(self):
         """停止监控"""
+
+        self.monitor1.stop()
+        self.monitor2.stop()
+        self.status_label1.set_status("STOP")
+        self.status_label2.set_status("STOP")
 
         self.run_stat = False
         self.timer.stop()  # 先停定时器，防止继续调用 send/recv
@@ -1305,7 +1667,9 @@ class RealTimePlotApp(QMainWindow):
         if ok and interval != current_interval:
             # 更新间隔值
             self.update_interval = interval
-            
+            self.monitor1.update_params(self.update_interval)
+            self.monitor2.update_params(self.update_interval)
+
             # 如果定时器正在运行，重新启动定时器
             if self.timer.isActive():
                 self.timer.stop()
@@ -1329,6 +1693,19 @@ class RealTimePlotApp(QMainWindow):
             
             print(f"Update interval changed to: {interval}ms")
 
+    def open_monitor_settings(self):
+        """打开状态监控设置对话框"""
+        dialog = MonitorSettingsDialog(
+            self.monitor1, self.monitor2, 
+            self.unit_ch1, self.unit_ch2, 
+            self
+        )
+        if dialog.exec_():
+            # 设置应用后，立即更新 Monitor 的采样率参数 (以防窗口时间改变)
+            self.monitor1.update_params(self.update_interval)
+            self.monitor2.update_params(self.update_interval)
+            print("Monitor settings updated.")
+
     def set_current_threshold(self):
         """设置电流过滤阈值对话框"""
         dialog = QDialog(self)
@@ -1337,7 +1714,7 @@ class RealTimePlotApp(QMainWindow):
         
         layout = QGridLayout()
         
-        # --- 通道 1 设置 ---
+        # 通道 1 设置
         layout.addWidget(QLabel("Channel 1 Max Limit:"), 0, 0)
         
         # 数值输入框
@@ -1353,7 +1730,7 @@ class RealTimePlotApp(QMainWindow):
         combo1.setCurrentText("mA") # 默认显示单位为mA，因为spinbox里填的是mA值
         layout.addWidget(combo1, 0, 2)
         
-        # --- 通道 2 设置 ---
+        # 通道 2 设置
         layout.addWidget(QLabel("Channel 2 Max Limit:"), 1, 0)
         
         # 数值输入框
@@ -1374,7 +1751,7 @@ class RealTimePlotApp(QMainWindow):
         note_label.setStyleSheet("color: gray; font-size: 10px;")
         layout.addWidget(note_label, 2, 0, 1, 3)
 
-        # --- 按钮区域 ---
+        # 按钮区域
         btn_box = QHBoxLayout()
         ok_btn = QPushButton("OK")
         ok_btn.clicked.connect(dialog.accept)
@@ -1578,7 +1955,7 @@ class RealTimePlotApp(QMainWindow):
         except Exception:
             return None
         
-        # --- 检查通道 1 的数据点 (使用 ax 的坐标系) ---
+        # 检查通道 1 的数据点 (使用 ax 的坐标系)
         xlim1 = self.ax.get_xlim()
         ylim1 = self.ax.get_ylim()
         x_range1 = xlim1[1] - xlim1[0]
@@ -1599,7 +1976,7 @@ class RealTimePlotApp(QMainWindow):
                     time_val = self.time_data[i] if hasattr(self, 'time_data') and i < len(self.time_data) else 0
                     closest_point = (1, i, x_data_point, y_data_point, time_val)
         
-        # --- 检查通道 2 的数据点 (使用 ax2 的坐标系) ---
+        # 检查通道 2 的数据点 (使用 ax2 的坐标系)
         if not self.single_channel_mode:
             xlim2 = self.ax2.get_xlim()
             ylim2 = self.ax2.get_ylim()
@@ -1909,7 +2286,7 @@ class RealTimePlotApp(QMainWindow):
             self.ax.set_xticklabels([x_labels[i] for i in tick_indices])
             
             # 7. 自动调整 Y 轴范围 (双轴独立调整)
-            # --- 调整左轴 (Channel 1) ---
+            # 调整左轴 (Channel 1)
             min_y1 = np.min(self.y_data1)
             max_y1 = np.max(self.y_data1)
             range_y1 = max_y1 - min_y1
@@ -1923,7 +2300,7 @@ class RealTimePlotApp(QMainWindow):
 
             self.ax.set_ylim(min_y1 - margin1, max_y1 + margin1)
             
-            # --- 调整右轴 (Channel 2) ---
+            # 调整右轴 (Channel 2)
             if not self.single_channel_mode:
                 min_y2 = np.min(self.y_data2)
                 max_y2 = np.max(self.y_data2)
@@ -1939,7 +2316,22 @@ class RealTimePlotApp(QMainWindow):
             # 重绘
             self.canvas.draw()
             
-            # 8. 写入文件 (传入转换后的 mA 值，write_data_row 内部需使用 .8e 格式)
+            # 8. 插入监控逻辑
+            if self.run_stat:
+                # 处理通道 1
+                # 注意：这里传入的值应该是对应单位的值。
+                # 如果 current1 是 mA，而设置里也是 mA，直接传。
+                state1 = self.monitor1.process(current1)
+                self.status_label1.set_status(state1)
+                
+                # 处理通道 2
+                if not self.single_channel_mode:
+                    state2 = self.monitor2.process(current2)
+                    self.status_label2.set_status(state2)
+                else:
+                    self.status_label2.set_status("STOP", "OFF")
+
+            # 9. 写入文件 (传入转换后的 mA 值，write_data_row 内部需使用 .8e 格式)
             self.write_data_row(now, runtime, current1_ma, current2_ma, integral1_float, integral2_float)
             
             # 打印日志
