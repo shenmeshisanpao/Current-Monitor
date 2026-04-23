@@ -531,29 +531,6 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         self.serialport2.stopbits = 1
         self.serialport2.timeout = 0.1
         
-        # 初始化两个串口
-        # self.serialport1 = serial.Serial()
-        # if sys.platform.startswith('win'):
-        #     self.serialport1.port = 'COM3'  # Windows 默认端口
-        # else:
-        #     self.serialport1.port = '/dev/ttyUSB0' # Linux 默认端口
-        # self.serialport1.baudrate = 9600
-        # self.serialport1.parity = 'N'
-        # self.serialport1.bytesize = 8
-        # self.serialport1.stopbits = 1
-        # self.serialport1.timeout = 0.1
-        
-        # self.serialport2 = serial.Serial()
-        # if sys.platform.startswith('win'):
-        #     self.serialport2.port = 'COM4'  # Windows 默认端口
-        # else:
-        #     self.serialport2.port = '/dev/ttyUSB1' # Linux 默认端口
-        # self.serialport2.baudrate = 9600
-        # self.serialport2.parity = 'N'
-        # self.serialport2.bytesize = 8
-        # self.serialport2.stopbits = 1
-        # self.serialport2.timeout = 0.1
-        
         # 初始化变量
         self.run_stat = False
         self.column_int1 = Decimal('0.0')  # 通道1电荷量
