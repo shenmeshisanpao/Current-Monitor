@@ -500,16 +500,20 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.setWindowIcon(icon)
             # 同时设置应用程序图标
             QApplication.instance().setWindowIcon(icon)
-
+        
+        # 定义默认波特率变量
+        self.baud_rate = 9600 
+        
         self.setGeometry(100, 100, 1200, 800)
         
         # 初始化两个串口
         self.serialport1 = serial.Serial()
         if sys.platform.startswith('win'):
-            self.serialport1.port = 'COM3'  # Windows 默认端口
+            self.serialport1.port = 'COM3'
         else:
-            self.serialport1.port = '/dev/ttyUSB0' # Linux 默认端口
-        self.serialport1.baudrate = 9600
+            self.serialport1.port = '/dev/ttyUSB0'
+            
+        self.serialport1.baudrate = self.baud_rate 
         self.serialport1.parity = 'N'
         self.serialport1.bytesize = 8
         self.serialport1.stopbits = 1
@@ -517,14 +521,38 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         
         self.serialport2 = serial.Serial()
         if sys.platform.startswith('win'):
-            self.serialport2.port = 'COM4'  # Windows 默认端口
+            self.serialport2.port = 'COM4'
         else:
-            self.serialport2.port = '/dev/ttyUSB1' # Linux 默认端口
-        self.serialport2.baudrate = 9600
+            self.serialport2.port = '/dev/ttyUSB1'
+            
+        self.serialport2.baudrate = self.baud_rate
         self.serialport2.parity = 'N'
         self.serialport2.bytesize = 8
         self.serialport2.stopbits = 1
         self.serialport2.timeout = 0.1
+        
+        # 初始化两个串口
+        # self.serialport1 = serial.Serial()
+        # if sys.platform.startswith('win'):
+        #     self.serialport1.port = 'COM3'  # Windows 默认端口
+        # else:
+        #     self.serialport1.port = '/dev/ttyUSB0' # Linux 默认端口
+        # self.serialport1.baudrate = 9600
+        # self.serialport1.parity = 'N'
+        # self.serialport1.bytesize = 8
+        # self.serialport1.stopbits = 1
+        # self.serialport1.timeout = 0.1
+        
+        # self.serialport2 = serial.Serial()
+        # if sys.platform.startswith('win'):
+        #     self.serialport2.port = 'COM4'  # Windows 默认端口
+        # else:
+        #     self.serialport2.port = '/dev/ttyUSB1' # Linux 默认端口
+        # self.serialport2.baudrate = 9600
+        # self.serialport2.parity = 'N'
+        # self.serialport2.bytesize = 8
+        # self.serialport2.stopbits = 1
+        # self.serialport2.timeout = 0.1
         
         # 初始化变量
         self.run_stat = False
@@ -698,6 +726,12 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         self.update_interval_action.triggered.connect(self.set_update_interval)
         self.update_interval_action.setToolTip("Set Data Update Interval")
         run_menu.addAction(self.update_interval_action)
+        
+        # 设置波特率的菜单项
+        self.set_baudrate_action = QtWidgets.QAction('Set Baud Rate', self)
+        self.set_baudrate_action.triggered.connect(self.set_baud_rate)
+        self.set_baudrate_action.setToolTip("Set Serial Port Baud Rate (Default: 9600)")
+        run_menu.addAction(self.set_baudrate_action)        
 
         # 状态监控设置菜单项
         self.monitor_settings_action = QtWidgets.QAction('Status Monitor Settings', self)
@@ -1452,10 +1486,11 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         # 运行时禁止设置单位和阈值
         self.set_units_action.setEnabled(False)
         self.set_limit_action.setEnabled(False)
-
         # 禁用模式切换
         self.mode_serial_action.setEnabled(False)
         self.mode_network_action.setEnabled(False)
+        # 运行时禁止修改波特率
+        self.set_baudrate_action.setEnabled(False) 
 
         # 初始化计时和数据
         self.start_time = self.get_time()
@@ -1544,13 +1579,14 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         # 停止后允许设置单位和阈值
         self.set_units_action.setEnabled(True)
         self.set_limit_action.setEnabled(True)
-
+        # 
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
-        
         # 启用模式切换
         self.mode_serial_action.setEnabled(True)
         self.mode_network_action.setEnabled(True)
+        # 停止后允许修改波特率
+        self.set_baudrate_action.setEnabled(True)
 
         # 停止脉冲提醒定时器
         if self.pulse_reminder_timer.isActive():
@@ -1658,11 +1694,11 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         interval, ok = QInputDialog.getInt(
             self, 
             'Set Update Interval', 
-            'Update Interval (milliseconds):\n\nAvailable range: 10-5000ms\nCurrent value: {}ms'.format(current_interval),
+            'Update Interval (milliseconds):\n\nAvailable range: 1-5000ms\nCurrent value: {}ms'.format(current_interval),
             current_interval,  # 默认值
-            10,               # 最小值
+            1,               # 最小值
             5000,             # 最大值
-            10                # 步长
+            1                # 步长
         )
         
         if ok and interval != current_interval:
@@ -1693,6 +1729,43 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                 )
             
             print(f"Update interval changed to: {interval}ms")
+
+    # 设置波特率的逻辑函数
+    def set_baud_rate(self):
+        """设置波特率对话框"""
+        # 常用波特率列表
+        rates = ["4800", "9600", "19200", "38400", "57600", "115200"]
+        
+        # 获取当前索引
+        current_str = str(self.baud_rate)
+        try:
+            index = rates.index(current_str)
+        except ValueError:
+            index = 1 # 默认 9600
+            
+        # 弹出选择框
+        item, ok = QInputDialog.getItem(
+            self, 
+            "Set Baud Rate", 
+            "Select Baud Rate:", 
+            rates, 
+            index, 
+            False # False 表示不可编辑，只能从列表中选
+        )
+        
+        if ok and item:
+            self.baud_rate = int(item)
+            # 更新串口对象的配置
+            self.serialport1.baudrate = self.baud_rate
+            self.serialport2.baudrate = self.baud_rate
+            
+            QMessageBox.information(
+                self, 
+                "Baud Rate Set", 
+                f"Baud Rate has been set to {self.baud_rate}.\\n"
+                f"This will take effect when monitoring starts."
+            )
+            print(f"Baud Rate changed to: {self.baud_rate}")
 
     def open_monitor_settings(self):
         """打开状态监控设置对话框"""
@@ -1783,7 +1856,6 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                                   f"Filter Thresholds Set:\n"
                                   f"Ch1: {self.limit_ch1_ma} mA\n"
                                   f"Ch2: {self.limit_ch2_ma} mA")
-
 
     def toggle_pulse_reminder(self):
         """切换脉冲提醒开关"""

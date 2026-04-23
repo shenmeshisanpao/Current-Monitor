@@ -1,6 +1,6 @@
 # 电流实时监控系统使用教程
 
-本教程由 Z.C. Zhang 最后一次修改于2026年1月28日。
+本教程由 Z.C. Zhang 最后一次修改于2026年4月23日。
 
 ---
 
@@ -34,7 +34,7 @@ dmesg -w
 
 这样就能看到USB设备被分配到了 `/dev/ttyUSB0` 串口。
 
-​
+
 
 - **获取IP地址和端口的方法如下：**
 
@@ -51,24 +51,18 @@ dmesg -w
 ## 额外功能
 
 1. 在电流监控运行期间，用户可以点击"Create Snapshot"按钮（快捷键Ctrl+S）保存当前记录文件的副本到记录文件同文件夹下。
-
 2. 在菜单栏"File"-"Open Data Folder"可以打开记录文件所在的文件夹。
-
 3. 在菜单栏"Run"-"Set Update Interval"可以设置读取电流的间隔，默认为100 ms。
-
 4. 在菜单栏"Run"-"Pulse Reminder"可以开启/关闭打脉冲提醒，默认开启。
-
 5. 默认为双表模式，可在菜单栏"Run"-"Single Channel Mode (CH1 Only)"切换到单表模式。
-
 6. 鼠标悬停在曲线上可以查看该点信息。
-
 7. 在菜单栏"Run"-"Set Channel Units"中可以设置电流表的单位(mA, μA, nA)。
-
 8. 在菜单栏"Run"-"Set Current Threshold"中可以设置电流阈值，如果读数超过阈值，将被视为无效而不记录。
-
 9. 在菜单栏"Run"-"Connect to DAQ (beta)"中可以与获取程序“DAQ_Master for BNU LAMBDA”联动，实现同步启停，自动命名、保存文件到root文件同目录下的current_data文件夹中。如失效，请确保使用了最新版的“DAQ_Master”获取程序。DAQ程序应可以自动修改"/tmp/daq_status.txt"以被读取状态。
-
 10. 在菜单栏"Run"-"Status Monitor Settings"中可对状态框进行设置。
+11. 在菜单栏"Run"-"Set Baud Rate"中可以设置串口的波特率，默认为 9600。
+
+
 
 第9点中的`/tmp/daq_status.txt`文件格式如下：
 
