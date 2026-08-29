@@ -1,6 +1,6 @@
 # 电流实时监控系统使用教程
 
-本教程由 Z.C. Zhang 最后一次修改于2026年4月23日。
+本教程由 Z.C. Zhang 最后一次修改于2026年8月30日。
 
 ---
 
@@ -53,18 +53,64 @@ dmesg -w
 1. 在电流监控运行期间，用户可以点击"Create Snapshot"按钮（快捷键Ctrl+S）保存当前记录文件的副本到记录文件同文件夹下。
 2. 在菜单栏"File"-"Open Data Folder"可以打开记录文件所在的文件夹。
 3. 在菜单栏"Run"-"Set Update Interval"可以设置读取电流的间隔，默认为100 ms。
-4. 在菜单栏"Run"-"Pulse Reminder"可以开启/关闭打脉冲提醒，默认开启。
-5. 默认为双表模式，可在菜单栏"Run"-"Single Channel Mode (CH1 Only)"切换到单表模式。
+4. 在菜单栏"Run"-"Pulse Reminder"可以开启/关闭打脉冲提醒（Ctrl+Shift+P），默认关闭。
+5. 默认为双表模式，可在菜单栏"Run"-"Single Channel Mode (CH1 Only)"切换到单表模式（Ctrl+Shift+S）。
 6. 鼠标悬停在曲线上可以查看该点信息。
 7. 在菜单栏"Run"-"Set Channel Units"中可以设置电流表的单位(mA, μA, nA)。
 8. 在菜单栏"Run"-"Set Current Threshold"中可以设置电流阈值，如果读数超过阈值，将被视为无效而不记录。
-9. 在菜单栏"Run"-"Connect to DAQ (beta)"中可以与获取程序“DAQ_Master for BNU LAMBDA”联动，实现同步启停，自动命名、保存文件到root文件同目录下的current_data文件夹中。如失效，请确保使用了最新版的“DAQ_Master”获取程序。DAQ程序应可以自动修改"/tmp/daq_status.txt"以被读取状态。
-10. 在菜单栏"Run"-"Status Monitor Settings"中可对状态框进行设置。
+9. 在菜单栏"Run"-"Connect to DAQ"下可选择与获取程序联动，实现同步启停和自动命名保存文件。提供两种互斥的联动模式，同一时间只能启用一种，也可都不启用。
+
+    - **DAQ_Master**：与获取程序"DAQ_Master for BNU LAMBDA"联动。启用后程序会监控`/tmp/daq_status.txt`文件的变化，自动同步启停，并根据轮次名和编号自动命名、保存文件到root文件同目录下的`current_data`文件夹中（联动期间"Save File Name"中手动设置的路径会被自动覆盖）。如失效，请确保使用了最新版的"DAQ_Master"获取程序。DAQ程序应可以自动修改`/tmp/daq_status.txt`以被读取状态。
+
+    - **GDDAQ**：与GDDAQ获取程序联动。启用前需先在"Connect to DAQ"-"GDDAQ Settings..."中配置参数：
+        - **Data Directory**：GDDAQ的数据根目录（即存放各轮次文件夹的目录，如`/home/rnb/Data/202605ams/raw/`）。该目录下应有以数字命名的轮次子文件夹（如`0001`、`0002`等），每个子文件夹内包含一个`run.log`文件。
+        - **Process Name**：GDDAQ的进程名（默认为`gddaq`），用于通过`pgrep -x`检测进程是否存活。
+        - **Run Number**：要监控的轮次编号。留空表示自动监控最大编号的轮次（即编号最大的子目录）；填入数字则监控指定轮次。
+
+        启用后程序会每秒轮询指定轮次的`run.log`文件，解析其中的`Start:`和`Stop`行来判断状态：
+        - 检测到`Start`行且进程存活 → 自动开始电流监控。
+        - 检测到`Stop`行 → 自动停止电流监控。
+        - 进程消失（`pgrep`失败）且`run.log`中无`Stop`行 → 判定为崩溃，自动停止监控并在状态栏提示"CRASHED"。
+
+        所有电流数据文件统一保存在数据根目录下的`CurrentData/`子文件夹中（如`/home/rnb/Data/202605ams/raw/CurrentData/run_00048.csv`），不会分散到各轮次文件夹内。
+
+        > **注意**：GDDAQ联动功能依赖`pgrep`命令，仅在Linux上可用。
+10. 主界面每个通道的读数旁有一个**状态指示灯**，实时反映该通道的信号状态：
+    - **RUN**（绿）：信号正常。
+    - **PEAK**（红，闪烁）/ **DROP**（橙，闪烁）：信号突变（仅直流模式）。
+    - **ZERO**（深红，闪烁）：信号为零或丢失，若开启报警音会同步响铃。
+    - **STOP**（灰）：未监控；单通道模式下 CH2 显示 **OFF**。
+    - 点击指示灯可手动清除 PEAK/DROP/ZERO 警告。
+
+    在菜单栏"Run"-"Status Monitor Settings"中可对状态监控进行设置。对话框顶部有全局报警音开关，下方每个通道可独立配置：
+    - **Alarm Sound**：全局开关（默认开启）。开启后，任一通道处于ZERO状态时，每3秒播放一次系统提示音（beep），直到状态恢复。
+    - **Enable Status Monitor**：是否启用该通道的状态监控。
+    - **History Window**：历史数据窗口长度（秒），用于计算直流模式下的基准线。
+    - **Zero Threshold**：零值判定阈值。直流模式下电流低于此值报警ZERO，电流恢复后指示灯自动转回RUN、报警音自动停止；脉冲模式下作为信号是否为零的判定阈值。
+    - **Pulse Mode**：脉冲模式开关。勾选后跳过突变检测（PEAK/DROP），仅检测信号丢失。适用于脉冲信号（如1Hz梯形脉冲），避免脉冲low期间的误报。
+    - **Zero Timeout**：脉冲模式下零值持续超时时间（秒，默认3.0）。电流持续为零超过此时间才报警ZERO，未超时则视为正常的脉冲low期。仅在勾选Pulse Mode时生效。
+    - **Threshold Mode / Value Threshold / Percent Threshold**：直流模式下的突变检测参数，脉冲模式下不生效。
+    - **Warning Hold Time**：直流模式下警告（PEAK/DROP）的保持时间。
 11. 在菜单栏"Run"-"Set Baud Rate"中可以设置串口的波特率，默认为 9600。
+12. **日志栏与日志窗口**：主界面最底部（绘图区下方）有一行高的日志栏，显示最近一条日志。点击它会打开日志窗口（Event Log）。
+
+    - 日志窗口是**非模态**的：打开后仍可正常操作主程序，也可以把它放到主窗口下层。窗口最多保留最近 **100 条**日志（从软件启动时开始记录），满 100 条后再产生新日志时会自动删除最早的一条。按设计**不提供清除按钮**。日志只保存在内存中，关闭软件后即清空，不写入文件。
+    - 日志格式为 `[时间] [级别] 内容`，并按重要性用颜色区分：
+
+      | 级别 | 颜色 | 含义 |
+      |---|---|---|
+      | **INFO** | 灰色 | 一般事件与成功操作 |
+      | **WARNING** | 橙色 | 警告，如串口/网络测试失败、数据文件为空导致快照失败等 |
+      | **ERROR** | 红色 | 错误，如连接失败、数据文件打开/关闭失败、快照创建失败等 |
+
+    - 记录的内容包括但不限于：软件启动与关闭、开始/停止监控、各项设置的 Apply、串口与网络测试的成败、快照创建成功或失败、数据文件读写异常、DAQ/GDDAQ 状态异常等。
+    - 其中**开始和停止监控会标明触发来源**，便于区分是人工操作还是联动自动触发：`(manual)` 表示手动点击按钮；`(daq_master)` 和 `(gddaq)` 分别表示由 DAQ_Master 或 GDDAQ 联动自动触发；`(daq_disabled)` 表示因取消勾选联动开关而停止。
+    - 若某个通道连续约 5 秒没有收到有效数据（例如串口线松动），会记录一条 WARNING；数据恢复正常后再记录一条 INFO。该提示经过去抖处理，不会因偶发丢包而反复刷屏。
+    - 注意：状态监控（Status Monitor）的 PEAK/DROP/ZERO 告警**不会**记入日志，仍仅由主界面上的状态指示灯显示；CSV 逐行写入、绘图刷新等高频操作同样不记录，以免日志被迅速填满。
 
 
 
-第9点中的`/tmp/daq_status.txt`文件格式如下：
+DAQ_Master模式中的`/tmp/daq_status.txt`文件格式如下：
 
 当DAQ停止运行时
 ```text
@@ -76,7 +122,8 @@ STATUS: STOPPED
 STATUS: RUNNING
 轮次名（一般为run）
 轮次号（如 180）
-DAQ保存root文件的地址（如 ./12Cag/target1/raw）
+DAQ保存root文件的完整地址（如 ./12Cag/target1/raw/target1_180.root）
+电流数据将自动保存到该文件同目录下的current_data文件夹中
 ```
 
 

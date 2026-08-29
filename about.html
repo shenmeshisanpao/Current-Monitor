@@ -1,7 +1,7 @@
 <div style="font-family: Arial, sans-serif; line-height: 1.6;">
 <center>
 <h2 style="color: #2E86AB; margin-bottom: 10px;">Real-Time Current Monitoring System</h2>
-<p><b>Version 2026.02.05</b></p>
+<p><b>Version v1.0.0</b></p>
 <p>Compatible with 創鴻高精度智能盤面表 DM4D-An-Rs</p>
 <p><b>Developer:</b> Zhicheng Zhang</p>
 <p><b>Email:</b> <a href="mailto:zhangzhicheng@cnncmail.cn">zhangzhicheng@cnncmail.cn</a></p>
@@ -26,7 +26,21 @@
 
 <div style="margin-left: 15px;">
 
-<h4 style="color: #4A90E2; margin-bottom: 5px;"> 2026-02-05 (Latest)</h4> 
+<h4 style="color: #4A90E2; margin-bottom: 5px;"> v1.0.0 (2026-08-30, Latest)</h4> 
+<ul style="margin-top: 5px; margin-bottom: 15px;"> 
+    <li>DAQ Integration Overhaul: Restructured "Connect to DAQ" into a submenu with two mutually exclusive options: DAQ_Master (renamed from "Connect to DAQ (beta)") and GDDAQ (new).</li>
+    <li>GDDAQ Support: Added automatic start/stop synchronization with GDDAQ acquisition system by monitoring <code>run.log</code> files. Includes crash detection via <code>pgrep</code> process monitoring.</li>
+    <li>GDDAQ Settings: Added a configuration dialog for GDDAQ data directory, process name, and target run number.</li>
+    <li>Pulse Reminder: Changed default state from enabled to disabled.</li>
+    <li>Status Monitor Pulse Mode: Added "Pulse Mode" option in Status Monitor Settings. When enabled, spike detection (PEAK/DROP) is skipped and only signal loss is monitored.</li>
+    <li>ZERO Alarm Sound: Added an audible alarm when any channel enters ZERO state. Can be toggled on/off in Status Monitor Settings (enabled by default).</li>
+    <li>Event Log Bar: Added a one-line log bar at the bottom of the main window (below the plot area), showing the most recent event. Click it to open the Event locking window.</li>
+    <li>Event Log Window: It records up to 100 events since startup. Logs are kept in memory only and are cleared on exit.</li>
+    <li>Log Severity Colors: Entries are formatted as <code>[time] [level] message</code> and color-coded by importance.</li>
+    <li>Bug Fix — DC Mode ZERO Auto-Recovery: Fixed an issue where the Status Monitor indicator stayed red indefinitely after a ZERO warning in DC mode, even after current recovered.</li>
+</ul>
+
+<h4 style="color: #4A90E2; margin-bottom: 5px;"> 2026-02-05</h4> 
 <ul style="margin-top: 5px; margin-bottom: 15px;"> 
     <li>Added "Set Baud Rate" in the Run menu to customize serial port baud rate (default 9600).</li>
     <li>Expanded the "Set Update Interval" range to allow a minimum of 1ms with 1ms steps.</li>

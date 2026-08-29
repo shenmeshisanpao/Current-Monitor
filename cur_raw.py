@@ -28,11 +28,14 @@ import numpy as np
 import shutil
 import re
 import socket
+import subprocess
+from datetime import datetime
 from decimal import Decimal, getcontext
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel, 
                              QPushButton, QHBoxLayout, QGridLayout, QLineEdit, QFileDialog,
-                             QMessageBox, QComboBox, QDialog, QTextBrowser, QInputDialog, QScrollArea)
+                             QMessageBox, QComboBox, QDialog, QTextBrowser, QInputDialog, QScrollArea,
+                             QCompleter, QDirModel)
 from PyQt5.QtCore import (QTimer, QUrl)
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -160,6 +163,111 @@ class SingleInstanceLock:
             finally:
                 self.lock_file = None
 
+class LogBus(QtCore.QObject):   # 类: 日志总线 (单例, 发布-订阅)
+    """日志总线：单例，收集最近 100 条日志并通过信号广播更新。
+    Log bus singleton: collects up to 100 most-recent log entries and
+    broadcasts updates via a Qt signal (publish-subscribe)."""
+    log_updated = QtCore.pyqtSignal()
+    _instance = None
+
+    # 颜色映射: INFO=蓝灰, WARNING=橙, ERROR=红
+    # Color mapping: INFO=blue-gray, WARNING=orange, ERROR=red
+    LEVEL_COLORS = {
+        "INFO":    "#555555",
+        "WARNING": "#FF8C00",
+        "ERROR":   "#D32F2F",
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # deque(maxlen=100) 满员后追加自动丢弃最左侧 (FIFO 删首)
+        # deque(maxlen=100) auto-drops oldest entry when full (FIFO)
+        self._entries = deque(maxlen=100)  # (timestamp_str, level, message)
+
+    @classmethod
+    def get_instance(cls):
+        """获取单例 (Get the singleton instance)"""
+        if cls._instance is None:
+            cls._instance = LogBus()
+        return cls._instance
+
+    def log(self, level, message):
+        """记录一条日志 (Record one log entry)
+        level: 'INFO' / 'WARNING' / 'ERROR'
+        message: 日志正文"""
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        self._entries.append((ts, level, message))
+        self.log_updated.emit()
+
+    def get_latest_text(self):
+        """返回最近一条的格式化文本 (供底部日志栏显示)
+        Return formatted text of the latest entry (for the bottom log bar)."""
+        if not self._entries:
+            return "Event Log: (no events yet)"
+        ts, level, msg = self._entries[-1]
+        return f"[{ts}] {msg}"
+
+    def get_latest_level(self):
+        """返回最近一条的级别 (供着色)
+        Return level of the latest entry (for coloring)."""
+        if not self._entries:
+            return "INFO"
+        return self._entries[-1][1]
+
+    def get_all_html(self):
+        """生成带颜色 span 的 HTML, 最新在底部 (供日志窗口显示)
+        Generate colored HTML, newest at bottom (for the log window)."""
+        import html as html_mod  # 局部导入, 避免与变量名冲突 (local import)
+        lines = []
+        for ts, level, msg in self._entries:
+            color = self.LEVEL_COLORS.get(level, "#555555")
+            safe_msg = html_mod.escape(msg)
+            lines.append(
+                f'<div style="color:{color};white-space:pre-wrap;">'
+                f'<span style="color:#888;">[{ts}]</span> '
+                f'<b>[{level}]</b> {safe_msg}'
+                f'</div>'
+            )
+        return "".join(lines)
+
+
+class LogWindow(QDialog):   # 类: 非模态日志窗口
+    """非模态日志窗口：只读 QTextBrowser, 按颜色区分级别, 最新在底部。
+    Non-modal log window: read-only text browser, color-coded, newest at bottom.
+    复用策略: closeEvent 仅 hide 不销毁, 由主窗口持有引用。
+    Reuse strategy: closeEvent hides instead of destroying; main window keeps the ref."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Event Log")
+        self.resize(700, 400)
+        self.log_bus = LogBus.get_instance()
+
+        layout = QVBoxLayout(self)
+        self.text_edit = QTextBrowser()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setOpenExternalLinks(False)
+        layout.addWidget(self.text_edit)
+
+        # 订阅更新信号 (Subscribe to update signal)
+        self.log_bus.log_updated.connect(self.refresh)
+
+    def refresh(self):
+        """刷新日志内容并滚动到底部 (Refresh and scroll to bottom)"""
+        self.text_edit.setHtml(self.log_bus.get_all_html())
+        sb = self.text_edit.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def showEvent(self, event):
+        """打开时全量刷新 (Full refresh on show)"""
+        self.refresh()
+        super().showEvent(event)
+
+    def closeEvent(self, event):
+        """隐藏而非销毁, 支持复用 (Hide instead of destroy, for reuse)"""
+        event.ignore()
+        self.hide()
+
 class ClickableLabel(QLabel):   # 类: 可点击的标签 (带闪烁功能)
     clicked = QtCore.pyqtSignal()
 
@@ -251,7 +359,12 @@ class StatusMonitor:    # 类: 监控逻辑核心
         self.spike_percent = 50.0  # 20%
         
         self.hold_time = 10.0      # 警告保持时间
-       
+        
+        # 脉冲模式设置
+        self.pulse_mode = False     # 脉冲模式开关，默认关闭(直流模式)
+        self.zero_timeout = 3.0     # 脉冲模式下零值持续超时时间(秒)
+        self.last_nonzero_time = 0  # 最后一次检测到非零电流的时间戳
+        
         # 内部状态
         self.warning_state = "RUN" # RUN, PEAK, DROP, ZERO
         self.warning_end_time = 0
@@ -262,11 +375,13 @@ class StatusMonitor:    # 类: 监控逻辑核心
         self.warning_state = "RUN"
         self.warning_end_time = 0
         self.is_running = False
+        self.last_nonzero_time = 0
 
     def start(self):
         self.is_running = True
         self.history.clear()
         self.warning_state = "RUN"
+        self.last_nonzero_time = time.time()  # 初始化为当前时间，避免启动瞬间误报
 
     def stop(self):
         self.is_running = False
@@ -299,6 +414,26 @@ class StatusMonitor:    # 类: 监控逻辑核心
         now = time.time()
         abs_val = abs(current_val)
 
+        # 脉冲模式：仅检测信号丢失，跳过突变检测
+        # 电流持续为零超过 zero_timeout 秒才报警 ZERO，避免脉冲 low 期误触发
+        if self.pulse_mode:
+            if abs_val >= self.zero_threshold:
+                # 检测到电流，更新时间戳
+                self.last_nonzero_time = now
+                if self.warning_state == "ZERO":
+                    self.warning_state = "RUN"
+                return "RUN"
+            else:
+                # 电流为零，检查是否超时
+                if now - self.last_nonzero_time > self.zero_timeout:
+                    self.warning_state = "ZERO"
+                    return "ZERO"
+                else:
+                    # 在 low 期但未超时，正常
+                    return "RUN"
+
+        # 以下为直流模式逻辑
+
         # 1. 检查警告是否过期 (如果当前是警告状态)
         if self.warning_state in ["PEAK", "DROP"]:
             if now > self.warning_end_time:
@@ -307,9 +442,13 @@ class StatusMonitor:    # 类: 监控逻辑核心
         # 2. 零值检测 (优先级最高)
         if abs_val < self.zero_threshold:
             self.warning_state = "ZERO"
-            # ZERO 状态通常不需要计时自动消失，或者可以视为一种特殊的DROP
-            # 这里设定为：只要是0就是ZERO，恢复了就变RUN
+            # ZERO 状态：电流恢复后自动变 RUN (由下面的恢复逻辑处理)
             return "ZERO"
+
+        # 2.5 ZERO 自动恢复 (直流模式)
+        # 电流已恢复到 >= zero_threshold，若之前是 ZERO 则改回 RUN
+        if self.warning_state == "ZERO":
+            self.warning_state = "RUN"
 
         # 3. 填充历史数据
         # 如果历史数据太少，处于初始化阶段，不报警
@@ -356,19 +495,26 @@ class StatusMonitor:    # 类: 监控逻辑核心
         return self.warning_state
 
 class MonitorSettingsDialog(QDialog):       #类: 设置对话框
-    def __init__(self, monitor1, monitor2, unit1, unit2, parent=None):
+    def __init__(self, monitor1, monitor2, unit1, unit2, alarm_enabled=True, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Status Monitor Settings")
         self.monitor1 = monitor1
         self.monitor2 = monitor2
         self.unit1 = unit1
         self.unit2 = unit2
+        self.alarm_enabled = alarm_enabled
         self.resize(400, 500)
         self.init_ui()
 
     def init_ui(self):
         layout = QVBoxLayout()
         
+        # 报警音开关 (全局)
+        self.alarm_cb = QtWidgets.QCheckBox("Alarm Sound (beep on ZERO)")
+        self.alarm_cb.setChecked(self.alarm_enabled)
+        self.alarm_cb.setToolTip("Play a system beep every 3 seconds when any channel is in ZERO state.")
+        layout.addWidget(self.alarm_cb)
+
         # 创建两个标签页分别设置两个通道
         tab_widget = QtWidgets.QTabWidget()
         tab_widget.addTab(self.create_channel_tab(self.monitor1, self.unit1), "Channel 1")
@@ -410,6 +556,22 @@ class MonitorSettingsDialog(QDialog):       #类: 设置对话框
         zero_spin.setValue(monitor.zero_threshold)
         zero_spin.setSuffix(f" {unit}")
         form.addRow("Zero Threshold:", zero_spin)
+
+        # 脉冲模式设置
+        form.addRow(QtWidgets.QLabel("--- Pulse Mode ---"))
+
+        pulse_cb = QtWidgets.QCheckBox("Pulse Mode (skip spike detection)")
+        pulse_cb.setChecked(monitor.pulse_mode)
+        pulse_cb.setToolTip("Enable for pulsed signals. Only detects signal loss (zero for extended period).")
+        form.addRow(pulse_cb)
+
+        zero_timeout_spin = QtWidgets.QDoubleSpinBox()
+        zero_timeout_spin.setRange(0.1, 60.0)
+        zero_timeout_spin.setDecimals(1)
+        zero_timeout_spin.setValue(monitor.zero_timeout)
+        zero_timeout_spin.setSuffix(" s")
+        zero_timeout_spin.setToolTip("In pulse mode, alarm ZERO if current stays at zero for this duration.")
+        form.addRow("Zero Timeout:", zero_timeout_spin)
 
         form.addRow(QtWidgets.QLabel("--- Warning Logic ---"))
 
@@ -456,6 +618,8 @@ class MonitorSettingsDialog(QDialog):       #类: 设置对话框
             "enable": enable_cb,
             "window": window_spin,
             "zero": zero_spin,
+            "pulse_mode": pulse_cb,
+            "zero_timeout": zero_timeout_spin,
             "mode_val": radio_val,
             "thresh_val": val_spin,
             "thresh_pct": pct_spin,
@@ -467,20 +631,138 @@ class MonitorSettingsDialog(QDialog):       #类: 设置对话框
 
     def accept(self):
         # 应用设置到 monitor 对象
+        # layout: [0]=alarm_cb, [1]=tab_widget, [2]=btn_box
+        tab_widget = self.layout().itemAt(1).widget()
         for i in range(2):
-            tab = self.layout().itemAt(0).widget().widget(i)
+            tab = tab_widget.widget(i)
             monitor = self.monitor1 if i == 0 else self.monitor2
             inputs = tab.inputs
             
             monitor.enabled = inputs["enable"].isChecked()
             monitor.window_seconds = inputs["window"].value()
             monitor.zero_threshold = inputs["zero"].value()
+            monitor.pulse_mode = inputs["pulse_mode"].isChecked()
+            monitor.zero_timeout = inputs["zero_timeout"].value()
             monitor.spike_mode = "value" if inputs["mode_val"].isChecked() else "percent"
             monitor.spike_threshold = inputs["thresh_val"].value()
             monitor.spike_percent = inputs["thresh_pct"].value()
             monitor.hold_time = inputs["hold"].value()
             
         super().accept()
+
+class GDDAQSettingsDialog(QDialog):      # 类: GDDAQ 设置对话框
+    def __init__(self, search_dir, proc_name, target_run, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("GDDAQ Settings")
+        self.resize(450, 180)
+        self.init_ui(search_dir, proc_name, target_run)
+
+    def init_ui(self, search_dir, proc_name, target_run):
+        layout = QtWidgets.QFormLayout()
+
+        # 1. 数据根目录 (带 Browse 按钮)
+        self.search_dir_input = QLineEdit(search_dir)
+        # 路径自动补全 (Path auto-completion via QCompleter + QDirModel)
+        _dir_completer = QCompleter(self)
+        _dir_model = QDirModel()
+        _dir_model.setFilter(QtCore.QDir.Dirs | QtCore.QDir.NoDotAndDotDot)
+        _dir_completer.setModel(_dir_model)
+        _dir_completer.setCompletionMode(QCompleter.PopupCompletion)
+        _dir_completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        self.search_dir_input.setCompleter(_dir_completer)
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self.browse_dir)
+        dir_layout = QHBoxLayout()
+        dir_layout.addWidget(self.search_dir_input)
+        dir_layout.addWidget(browse_btn)
+        dir_widget = QWidget()
+        dir_widget.setLayout(dir_layout)
+        layout.addRow("Data Directory:", dir_widget)
+
+        # 2. 进程名 (必填)
+        self.proc_name_input = QLineEdit(proc_name)
+        self.proc_name_input.setPlaceholderText("e.g. gddaq")
+        self.proc_name_input.setToolTip("DAQ process name for pgrep -x detection (e.g. gddaq)")
+        layout.addRow("Process Name:", self.proc_name_input)
+
+        # 3. 监控轮次 (可留空 = 自动监控最大编号的轮次)
+        self.target_run_input = QLineEdit(target_run)
+        self.target_run_input.setPlaceholderText("Leave empty = auto (highest run number)")
+        self.target_run_input.setToolTip("Leave empty to auto-monitor the run with the highest number; fill a number to monitor a specific run")
+        layout.addRow("Run Number:", self.target_run_input)
+
+        # 说明标签
+        note = QLabel("Note: Run number corresponds to numbered subdirectories under the data directory.\n"
+                      "Leave empty to auto-monitor the run with the highest number.")
+        note.setStyleSheet("color: gray; font-size: 10px;")
+        note.setWordWrap(True)
+        layout.addRow(note)
+
+        # 校验状态提示标签 (红字显示错误原因)
+        # Validation status label (shows error reason in red)
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: red; font-size: 10px;")
+        self.status_label.setWordWrap(True)
+        layout.addRow(self.status_label)
+
+        # 按钮
+        btn_box = QHBoxLayout()
+        self.ok_btn = QPushButton("Apply && Close")
+        self.ok_btn.clicked.connect(self.on_apply)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_box.addWidget(self.ok_btn)
+        btn_box.addWidget(cancel_btn)
+        layout.addRow(btn_box)
+
+        self.setLayout(layout)
+
+        # 必填项校验: Data Directory / Process Name 为空时禁用 Apply 按钮 (只能 Cancel)
+        # Required-field validation: disable Apply when Data Directory / Process Name is empty
+        self.search_dir_input.textChanged.connect(self.validate_inputs)
+        self.proc_name_input.textChanged.connect(self.validate_inputs)
+        self.validate_inputs()
+
+    def validate_inputs(self):
+        """校验必填项与目录有效性，控制 Apply 按钮可用状态
+        (Validate required fields and directory existence, toggle Apply button)"""
+        search_dir = self.search_dir_input.text().strip()
+        proc_name = self.proc_name_input.text().strip()
+
+        if not search_dir or not proc_name:
+            reason = "Data Directory and Process Name are required."
+        elif not os.path.isdir(search_dir):
+            reason = "Data Directory does not exist."
+        else:
+            reason = ""
+
+        self.ok_btn.setEnabled(not reason)
+        self.status_label.setText(reason)
+        self.ok_btn.setToolTip(reason)
+
+    def on_apply(self):
+        """Apply 前最终校验，防止目录在输入后被外部删除
+        (Final validation before applying, in case the directory was removed)"""
+        if not self.ok_btn.isEnabled():
+            self.validate_inputs()
+            return
+        self.accept()
+
+    def browse_dir(self):
+        """浏览选择数据根目录"""
+        current = self.search_dir_input.text().strip()
+        start_dir = current if current else os.path.expanduser("~")
+        chosen = QFileDialog.getExistingDirectory(self, "Select GDDAQ Data Directory", start_dir)
+        if chosen:
+            self.search_dir_input.setText(chosen)
+
+    def get_values(self):
+        """获取设置值"""
+        return (
+            self.search_dir_input.text().strip(),
+            self.proc_name_input.text().strip() or "gddaq",
+            self.target_run_input.text().strip()
+        )
 
 class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
     def __init__(self):
@@ -561,11 +843,18 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         self.limit_ch2_ma = 1000.0
 
         # 脉冲提醒相关变量
-        self.pulse_reminder_enabled = True  # 脉冲提醒开关，默认开启
+        self.pulse_reminder_enabled = False  # 脉冲提醒开关，默认关闭
         self.pulse_reminder_timer = QTimer()  # 脉冲提醒定时器
         self.pulse_reminder_timer.timeout.connect(self.show_pulse_reminder)
         self.pulse_reminder_timer.setSingleShot(True)  # 单次触发
         self.reminder_suppressed = False  # 本轮是否已抑制提醒
+
+        # ZERO 报警音相关变量
+        self.alarm_enabled = True        # 报警音开关，默认开启
+        self.alarm_active = False        # 报警音是否正在响（避免重复启停定时器）
+        self.alarm_timer = QTimer()      # 报警周期定时器 (每3秒响一次)
+        self.alarm_timer.setInterval(3000)  # 3000 ms
+        self.alarm_timer.timeout.connect(self.on_alarm_tick)
 
         # 鼠标悬停相关属性
         self.hover_annotation = None       
@@ -577,6 +866,21 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         self.daq_timer.timeout.connect(self.check_daq_status)
         self.daq_timer.setInterval(200)  # 每200ms检查一次文件
 
+        # GDDAQ 监控初始化
+        self.gddaq_search_dir = ""          # 数据根目录 (如 /home/rnb/Data/202605ams/raw/)
+        self.gddaq_proc_name = "gddaq"      # DAQ 进程名 (用于 pgrep -x)
+        self.gddaq_target_run = ""          # 目标轮次 (空=自动监控最新轮次)
+        self.gddaq_timer = QTimer()
+        self.gddaq_timer.timeout.connect(self.check_gddaq_status)
+        self.gddaq_timer.setInterval(1000)  # 每1秒检查一次
+        self.gddaq_last_state = "IDLE"      # 上次状态: IDLE / RUNNING / FINISHED / CRASHED
+        self.gddaq_last_log_mtime = 0       # run.log 上次 mtime
+        self.gddaq_last_alive_time = None   # 进程最后存活时刻 (崩溃时冻结计时)
+        self.gddaq_dir_invalid_logged = False  # 数据目录失效日志去重标志 (每 run 只记一次)
+
+        # DAQ 模式互斥标记: None / "daq_master" / "gddaq"
+        self.active_daq_mode = None
+
         # 状态监控初始化
         self.monitor1 = StatusMonitor()
         self.monitor2 = StatusMonitor()
@@ -584,14 +888,32 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         self.monitor1.update_params(self.update_interval)
         self.monitor2.update_params(self.update_interval)
 
+        # 日志系统初始化 (Log system initialization)
+        self.log_bus = LogBus.get_instance()
+        self.log_window = None  # 延迟创建, 首次打开时实例化 (lazy-init)
+        # About / Tutorial 对话框单实例引用 (非模态, 可同时操作主窗口)
+        self._about_dialog = None
+        self._tutorial_dialog = None
+        # recv_data 连续无响应去抖计数器 (debounce counters for recv timeouts)
+        # 达阈值(~5秒无数据)记一条 WARNING, 恢复时记 INFO
+        self.recv_none_count_1 = 0
+        self.recv_none_count_2 = 0
+        self.recv_warned_1 = False
+        self.recv_warned_2 = False
+
         # 然后创建UI和菜单栏
         self.init_ui()
         self.create_menu_bar()
-        
+        # 订阅日志更新信号 (Subscribe to log update signal)
+        self.log_bus.log_updated.connect(self.on_log_updated)
+
         # 创建定时器
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_data)
         self.timer.start(self.update_interval)
+
+        # 记录启动日志 (Record startup log)
+        self.log_bus.log("INFO", "Application started")
         
     def create_menu_bar(self):
         """创建菜单栏"""
@@ -672,7 +994,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         # 脉冲提醒开关菜单项
         self.pulse_reminder_action = QtWidgets.QAction('Pulse Reminder', self)
         self.pulse_reminder_action.setCheckable(True)
-        self.pulse_reminder_action.setChecked(True)  # 默认开启
+        self.pulse_reminder_action.setChecked(False)  # 默认关闭
         self.pulse_reminder_action.triggered.connect(self.toggle_pulse_reminder)
         self.pulse_reminder_action.setShortcut('Ctrl+Shift+P')
         self.pulse_reminder_action.setToolTip("Enable/Disable Pulse Reminder")
@@ -680,13 +1002,36 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
 
         # run_menu.addSeparator()
 
-        # DAQ 连接菜单项
-        self.daq_connect_action = QtWidgets.QAction('Connect to DAQ (beta)', self)
+        # DAQ 连接二级菜单
+        daq_submenu = run_menu.addMenu('Connect to DAQ')
+
+        # DAQ_Master 选项 (原 Connect to DAQ (beta))
+        self.daq_connect_action = QtWidgets.QAction('DAQ_Master', self)
         self.daq_connect_action.setCheckable(True)
         self.daq_connect_action.setChecked(False)
         self.daq_connect_action.triggered.connect(self.toggle_daq_connection)
-        self.daq_connect_action.setToolTip("Sync Start/Stop and Filename with DAQ System")
-        run_menu.addAction(self.daq_connect_action)        
+        self.daq_connect_action.setToolTip("Sync Start/Stop and Filename with DAQ_Master System")
+        daq_submenu.addAction(self.daq_connect_action)
+
+        # GDDAQ 选项
+        self.gddaq_connect_action = QtWidgets.QAction('GDDAQ', self)
+        self.gddaq_connect_action.setCheckable(True)
+        self.gddaq_connect_action.setChecked(False)
+        self.gddaq_connect_action.triggered.connect(self.toggle_gddaq_connection)
+        self.gddaq_connect_action.setToolTip("Sync Start/Stop with GDDAQ System via run.log monitoring")
+        daq_submenu.addAction(self.gddaq_connect_action)
+
+        # 注意：不使用 QActionGroup 的互斥功能 (exclusive 默认 True 会阻止取消勾选)。
+        # 互斥逻辑由 toggle_daq_connection / toggle_gddaq_connection 内部处理：
+        # 启用一方时主动取消另一方的勾选并调用其 toggle 方法。
+
+        daq_submenu.addSeparator()
+
+        # GDDAQ 设置入口
+        self.gddaq_settings_action = QtWidgets.QAction('GDDAQ Settings...', self)
+        self.gddaq_settings_action.triggered.connect(self.open_gddaq_settings)
+        self.gddaq_settings_action.setToolTip("Configure GDDAQ data directory, process name and run number")
+        daq_submenu.addAction(self.gddaq_settings_action)
 
         run_menu.addSeparator()
 
@@ -754,12 +1099,20 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.current2_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #ff7f0e;")
             
         print(f"Mode Switched: {'Single Channel' if self.single_channel_mode else 'Dual Channel'}")
+        self.log_bus.log("INFO", f"Mode switched to {'Single' if self.single_channel_mode else 'Dual'} Channel")
 
-    def toggle_daq_connection(self):    #  DAQ 联动功能实现
-        """切换 DAQ 连接模式"""
+    def toggle_daq_connection(self):    #  DAQ_Master 联动功能实现
+        """切换 DAQ_Master 连接模式 (与 GDDAQ 互斥)"""
         is_connected = self.daq_connect_action.isChecked()
         
         if is_connected:
+            # 互斥：如果 GDDAQ 正在运行，先关闭它
+            if self.active_daq_mode == "gddaq":
+                self.gddaq_connect_action.setChecked(False)
+                self.toggle_gddaq_connection()
+
+            self.active_daq_mode = "daq_master"
+
             # 开启模式：锁定文件名输入，初始化时间戳，启动定时器
             self.filename_input.setEnabled(False)
             self.browse_button.setEnabled(False)
@@ -773,17 +1126,26 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                     self.daq_last_mtime = 0
             
             self.daq_timer.start()
-            print("DAQ Connection Enabled: Monitoring started.")
-            self.save_status_label.setText("DAQ Mode: Waiting for signal...")
+            print("DAQ_Master Connection Enabled: Monitoring started.")
+            self.log_bus.log("INFO", "DAQ_Master auto-link enabled")
+            self.save_status_label.setText("DAQ_Master Mode: Waiting for signal...")
             self.save_status_label.setStyleSheet("color: blue;")
         else:
+            self.active_daq_mode = None
+
             # 关闭模式：停止定时器，恢复输入框
             self.daq_timer.stop()
+
+            # 如果正在运行，停止监控
+            if self.run_stat:
+                self.stop_monitoring(source="daq_disabled")
+
             self.filename_input.setEnabled(True)
             self.browse_button.setEnabled(True)
             self.file_mode_combo.setEnabled(True)
-            print("DAQ Connection Disabled.")
-            self.save_status_label.setText("DAQ Mode: Disabled")
+            print("DAQ_Master Connection Disabled.")
+            self.log_bus.log("INFO", "DAQ_Master auto-link disabled")
+            self.save_status_label.setText("DAQ_Master Mode: Disabled")
             self.save_status_label.setStyleSheet("color: black;")
 
     def check_daq_status(self):
@@ -841,9 +1203,10 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                         # 3. 更新 UI 并启动
                         self.filename_input.setText(full_path)
                         print(f"DAQ Signal: START. File: {full_path}")
-                        
+                        self.log_bus.log("INFO", f"DAQ_Master signal: START (file={filename})")
+
                         # 确保使用覆盖模式或追加模式，这里默认追加即可，因为是新文件
-                        self.start_monitoring()
+                        self.start_monitoring(source="daq_master")
                         
                         # 更新状态提示
                         self.save_status_label.setText(f"DAQ Linked: Running {filename}")
@@ -852,12 +1215,329 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                 elif "STATUS: STOPPED" in status_line:
                     if self.run_stat:
                         print("DAQ Signal: STOP received.")
-                        self.stop_monitoring()
+                        self.log_bus.log("INFO", "DAQ_Master signal: STOP")
+                        self.stop_monitoring(source="daq_master")
                         self.save_status_label.setText("DAQ Linked: Stopped")
                         self.save_status_label.setStyleSheet("color: orange;")
 
         except Exception as e:
             print(f"Error checking DAQ status: {e}")
+            self.log_bus.log("WARNING", f"DAQ status file read error: {e}")
+
+    # ===================== GDDAQ 联动功能 =====================
+
+    def open_gddaq_settings(self):
+        """打开 GDDAQ 设置对话框"""
+        dialog = GDDAQSettingsDialog(
+            self.gddaq_search_dir,
+            self.gddaq_proc_name,
+            self.gddaq_target_run,
+            self
+        )
+        if dialog.exec_() == QDialog.Accepted:
+            self.gddaq_search_dir, self.gddaq_proc_name, self.gddaq_target_run = dialog.get_values()
+            print(f"GDDAQ Settings Updated: dir={self.gddaq_search_dir}, proc={self.gddaq_proc_name}, run={self.gddaq_target_run or '(auto)'}")
+            self.log_bus.log("INFO",
+                f"GDDAQ settings applied: dir={self.gddaq_search_dir}, "
+                f"proc={self.gddaq_proc_name}, run={self.gddaq_target_run or '(auto)'}")
+
+    def toggle_gddaq_connection(self):
+        """切换 GDDAQ 连接模式 (与 DAQ_Master 互斥)"""
+        is_connected = self.gddaq_connect_action.isChecked()
+
+        if is_connected:
+            # Windows 不支持 GDDAQ (依赖 pgrep)
+            if sys.platform.startswith('win'):
+                QMessageBox.warning(self, "Warning",
+                    "GDDAQ mode is only available on Linux (requires pgrep).\n"
+                    "Please use DAQ_Master mode instead.")
+                self.gddaq_connect_action.setChecked(False)
+                return
+
+            # 互斥：如果 DAQ_Master 正在运行，先关闭它
+            if self.active_daq_mode == "daq_master":
+                self.daq_connect_action.setChecked(False)
+                self.toggle_daq_connection()
+
+            # 检查必填配置: 数据目录和进程名均不能为空
+            # Required config check: both data directory and process name must be set
+            if not self.gddaq_search_dir or not self.gddaq_proc_name:
+                QMessageBox.warning(self, "Warning",
+                    "GDDAQ Data Directory and Process Name must be set!\n"
+                    "Please configure them via 'Connect to DAQ' -> 'GDDAQ Settings...' first.")
+                self.gddaq_connect_action.setChecked(False)
+                return
+
+            if not os.path.isdir(self.gddaq_search_dir):
+                QMessageBox.warning(self, "Warning",
+                    f"GDDAQ data directory does not exist:\n{self.gddaq_search_dir}")
+                self.gddaq_connect_action.setChecked(False)
+                return
+
+            self.active_daq_mode = "gddaq"
+
+            # 锁定文件名输入 (与 DAQ_Master 行为一致)
+            self.filename_input.setEnabled(False)
+            self.browse_button.setEnabled(False)
+            self.file_mode_combo.setEnabled(False)
+
+            # 重置状态
+            self.gddaq_last_state = "IDLE"
+            self.gddaq_last_log_mtime = 0
+            self.gddaq_last_alive_time = None
+            self.gddaq_dir_invalid_logged = False  # 重置目录失效去重标志
+
+            self.gddaq_timer.start()
+            print("GDDAQ Connection Enabled: Monitoring started.")
+            self.log_bus.log("INFO", "GDDAQ auto-link enabled")
+            self.save_status_label.setText("GDDAQ Mode: Waiting for run.log signal...")
+            self.save_status_label.setStyleSheet("color: blue;")
+        else:
+            # 关闭模式
+            self.gddaq_timer.stop()
+            self.active_daq_mode = None
+
+            # 如果正在运行，停止监控
+            if self.run_stat:
+                self.stop_monitoring(source="daq_disabled")
+
+            # 恢复 UI
+            self.filename_input.setEnabled(True)
+            self.browse_button.setEnabled(True)
+            self.file_mode_combo.setEnabled(True)
+            print("GDDAQ Connection Disabled.")
+            self.log_bus.log("INFO", "GDDAQ auto-link disabled")
+            self.save_status_label.setText("GDDAQ Mode: Disabled")
+            self.save_status_label.setStyleSheet("color: black;")
+
+    def is_gddaq_running(self):
+        """通过 pgrep -x 检测 DAQ 进程是否存活 (参考 run_timer.py)"""
+        try:
+            result = subprocess.run(
+                ["pgrep", "-x", self.gddaq_proc_name],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            return result.returncode == 0
+        except Exception:
+            # pgrep 不存在 (如 Windows) 或其他错误，视为未运行
+            return False
+
+    def get_gddaq_run_dir(self):
+        """
+        返回目标轮次的数据目录路径。
+        - target_run 为空: 返回 search_dir 下最大编号的数字子目录
+        - target_run 非空: 返回 search_dir/<target_run> 目录
+        返回 (run_dir, run_id_str) 或 (None, error_msg)
+        参考 run_timer.py 的 get_run_data() 逻辑。
+        """
+        try:
+            # 获取所有数字命名的子目录
+            dirs = [
+                d for d in os.listdir(self.gddaq_search_dir)
+                if os.path.isdir(os.path.join(self.gddaq_search_dir, d)) and d.isdigit()
+            ]
+
+            if not dirs:
+                return None, "No numbered run folders found"
+
+            if self.gddaq_target_run:
+                # 指定轮次
+                target = self.gddaq_target_run.lstrip('0') or '0'
+                # 尝试匹配: 数字比较
+                matched = None
+                for d in dirs:
+                    if int(d) == int(target):
+                        matched = d
+                        break
+                if matched is None:
+                    return None, f"Run {self.gddaq_target_run} not found"
+                latest_dir = matched
+            else:
+                # 自动取最大编号
+                latest_dir = max(dirs, key=int)
+
+            return os.path.join(self.gddaq_search_dir, latest_dir), latest_dir
+
+        except Exception as e:
+            return None, str(e)
+
+    def parse_gddaq_run_log(self, log_path):
+        """
+        解析 run.log 文件，返回 (start_time, stop_time)。
+        参考 run_timer.py 的解析逻辑:
+        - 一个 run.log 可能含多个 Start/Stop 块 (重跑场景)，只取最后一个 Start 及其后是否有 Stop
+        - Start 行格式: "Start: 2025-12-10 17:21:49"
+        - Stop 行格式: "Stop : 2025-12-10 17:21:47" (注意 Stop 后有空格，用 split(":", 1) 处理)
+        - 新的 Start 会使其之前的 Stop 失效
+        返回 (datetime, datetime or None)，解析失败返回 (None, None)
+        """
+        start_time = None
+        stop_time = None
+
+        try:
+            with open(log_path, "r") as f:
+                for line in f:
+                    if line.startswith("Start:"):
+                        t_str = line.split("Start:")[1].strip()
+                        try:
+                            start_time = datetime.strptime(t_str, "%Y-%m-%d %H:%M:%S")
+                            # 新的 Start 使之前的 Stop 失效
+                            stop_time = None
+                        except ValueError:
+                            pass
+                    elif line.startswith("Stop"):
+                        # 格式 "Stop : 2025-12-10 17:21:47" — 用 split(":", 1) 松散处理
+                        parts = line.split(":", 1)
+                        if len(parts) > 1:
+                            t_str = parts[1].strip()
+                            try:
+                                stop_time = datetime.strptime(t_str, "%Y-%m-%d %H:%M:%S")
+                            except ValueError:
+                                pass
+        except Exception:
+            pass
+
+        return start_time, stop_time
+
+    def check_gddaq_status(self):
+        """
+        定时检查 GDDAQ 状态 (参考 run_timer.py 的状态机)。
+        状态流转:
+        - IDLE → 检测到 Start 且无 Stop → RUNNING (自动 start_monitoring)
+        - RUNNING → 检测到 Stop → FINISHED (自动 stop_monitoring)
+        - RUNNING → pgrep 失败且无 Stop → CRASHED (自动 stop_monitoring，状态栏提示)
+        - 每次轮询记录上次状态，避免重复触发启停
+        """
+        try:
+            # 0. 检查数据根目录有效性 (运行期间可能被删除/卸载, 如 NFS 掉线)
+            # Check data root validity (may be deleted/unmounted during a run, e.g. NFS dropout)
+            if not os.path.isdir(self.gddaq_search_dir):
+                if not self.gddaq_dir_invalid_logged:
+                    self.log_bus.log("WARNING",
+                        f"GDDAQ: data directory became invalid: {self.gddaq_search_dir}")
+                    self.gddaq_dir_invalid_logged = True
+                self.save_status_label.setText("GDDAQ: data directory invalid!")
+                self.save_status_label.setStyleSheet("color: red;")
+                return
+            else:
+                # 目录恢复有效时重置去重标志, 下次失效可再次记录
+                self.gddaq_dir_invalid_logged = False
+
+            # 1. 获取目标轮次目录
+            run_dir, run_id = self.get_gddaq_run_dir()
+            if run_dir is None:
+                # 目录不存在或无轮次文件夹，保持等待
+                if self.gddaq_last_state != "IDLE":
+                    print(f"GDDAQ: {run_id}")
+                    self.gddaq_last_state = "IDLE"
+                return
+
+            log_path = os.path.join(run_dir, "run.log")
+
+            if not os.path.exists(log_path):
+                # run.log 尚未创建，保持等待
+                return
+
+            # 2. 检查 mtime 是否变化 (减少 I/O)
+            try:
+                current_log_mtime = os.path.getmtime(log_path)
+            except OSError:
+                return
+
+            log_changed = current_log_mtime > self.gddaq_last_log_mtime
+            if log_changed:
+                self.gddaq_last_log_mtime = current_log_mtime
+
+            # 3. 解析 run.log
+            start_time, stop_time = self.parse_gddaq_run_log(log_path)
+
+            # 4. 检测进程存活
+            proc_alive = self.is_gddaq_running()
+
+            # 5. 状态判定 (参考 run_timer.py)
+            now = datetime.now()
+
+            if start_time is None:
+                # 还没有 Start 行，等待中
+                if self.gddaq_last_state != "IDLE":
+                    self.gddaq_last_state = "IDLE"
+                    self.save_status_label.setText(f"GDDAQ: Run {run_id} waiting for Start...")
+                    self.save_status_label.setStyleSheet("color: blue;")
+                return
+
+            if stop_time is not None:
+                # 有 Stop → 已结束
+                if self.gddaq_last_state != "FINISHED":
+                    print(f"GDDAQ: Run {run_id} FINISHED (Stop detected in run.log)")
+                    self.log_bus.log("INFO", f"GDDAQ: run {run_id} finished")
+                    self.gddaq_last_state = "FINISHED"
+                    if self.run_stat:
+                        self.stop_monitoring(source="gddaq")
+                    self.save_status_label.setText(f"GDDAQ: Run {run_id} Finished")
+                    self.save_status_label.setStyleSheet("color: green;")
+                return
+
+            # 无 Stop 的情况
+            if proc_alive:
+                # 进程存活且无 Stop → 正在运行
+                self.gddaq_last_alive_time = now
+
+                if self.gddaq_last_state != "RUNNING":
+                    print(f"GDDAQ: Run {run_id} RUNNING (Start detected, process alive)")
+                    self.log_bus.log("INFO", f"GDDAQ: run {run_id} started")
+                    self.gddaq_last_state = "RUNNING"
+
+                    # 生成保存路径: <search_dir>/CurrentData/run_<run_id:05d>.csv
+                    save_dir = os.path.join(self.gddaq_search_dir, "CurrentData")
+                    if not os.path.exists(save_dir):
+                        try:
+                            os.makedirs(save_dir, exist_ok=True)
+                        except Exception as e:
+                            print(f"GDDAQ: Error creating save directory: {e}")
+                            self.log_bus.log("ERROR", f"GDDAQ: cannot create save directory: {e}")
+                            return
+
+                    run_num = int(run_id)
+                    filename = f"run_{run_num:05d}.csv"
+                    full_path = os.path.join(save_dir, filename)
+
+                    # 更新 UI 文件名并启动监控
+                    if not self.run_stat:
+                        self.filename_input.setText(full_path)
+                        print(f"GDDAQ: Auto-starting monitoring. File: {full_path}")
+                        self.start_monitoring(source="gddaq")
+
+                    self.save_status_label.setText(f"GDDAQ: Running {filename}")
+                    self.save_status_label.setStyleSheet("color: green;")
+                else:
+                    # 已在 RUNNING 状态，仅更新运行时间显示
+                    if self.gddaq_last_alive_time is not None:
+                        runtime = now - self.gddaq_last_alive_time
+                        # 不频繁更新，避免刷屏
+            else:
+                # 进程不存活且无 Stop → 可能崩溃
+                # 参考 run_timer.py: 冻结计时在最后存活时刻
+                if self.gddaq_last_alive_time is None:
+                    self.gddaq_last_alive_time = now
+
+                if self.gddaq_last_state != "CRASHED":
+                    print(f"GDDAQ: Run {run_id} CRASHED (process '{self.gddaq_proc_name}' not found, no Stop in log)")
+                    self.log_bus.log("WARNING", f"GDDAQ: process died (run {run_id})")
+                    self.gddaq_last_state = "CRASHED"
+
+                    if self.run_stat:
+                        self.stop_monitoring(source="gddaq")
+
+                    self.save_status_label.setText(f"GDDAQ: Run {run_id} CRASHED! Process '{self.gddaq_proc_name}' not found.")
+                    self.save_status_label.setStyleSheet("color: red;")
+
+        except Exception as e:
+            print(f"Error checking GDDAQ status: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # ===================== GDDAQ 联动功能结束 =====================
 
     def init_ui(self):
         # 主布局
@@ -908,6 +1588,14 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         self.filename_label = QLabel("Save File Name:")
         self.filename_input = QLineEdit(self.filename)
         self.filename_input.setMinimumWidth(300)
+        # 路径自动补全 (含目录和文件, 方便选择已有 CSV) (Path auto-completion: dirs + files)
+        _file_completer = QCompleter(self)
+        _file_model = QDirModel()
+        _file_model.setFilter(QtCore.QDir.Dirs | QtCore.QDir.Files | QtCore.QDir.NoDotAndDotDot)
+        _file_completer.setModel(_file_model)
+        _file_completer.setCompletionMode(QCompleter.PopupCompletion)
+        _file_completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        self.filename_input.setCompleter(_file_completer)
         
         # 浏览按钮
         self.browse_button = QPushButton("Browse...")
@@ -1038,7 +1726,47 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         main_layout.addLayout(status_layout)
         main_layout.addLayout(button_layout)
         main_layout.addWidget(self.canvas)
-    
+
+        # 底部日志栏 (一行, 显示最近一条日志, 点击打开日志窗口)
+        # Bottom log bar: one line, shows latest entry, click to open log window
+        self.log_bar = ClickableLabel("Event Log: (no events yet)")
+        self.log_bar.setFixedHeight(24)
+        self.log_bar.setStyleSheet(
+            "background: #f0f0f0; border-top: 1px solid #ccc; "
+            "padding: 2px 6px; color: #555555; font-size: 12px; "
+            "qproperty-alignment: AlignVCenter; border-radius: 0px;"
+        )
+        self.log_bar.setToolTip("Click to view full event log")
+        self.log_bar.clicked.connect(self.open_log_window)
+        main_layout.addWidget(self.log_bar)
+
+    def on_log_updated(self):
+        """日志总线更新回调: 刷新底部日志栏文本/颜色, 并在窗口可见时刷新窗口
+        (Log bus update callback: refresh bottom bar text/color and window if visible)"""
+        if not hasattr(self, 'log_bar'):
+            return
+        text = self.log_bus.get_latest_text()
+        level = self.log_bus.get_latest_level()
+        color = LogBus.LEVEL_COLORS.get(level, "#555555")
+        self.log_bar.setText(text)
+        self.log_bar.setStyleSheet(
+            f"background: #f0f0f0; border-top: 1px solid #ccc; "
+            f"padding: 2px 6px; color: {color}; font-size: 12px; "
+            f"qproperty-alignment: AlignVCenter; border-radius: 0px;"
+        )
+        # 若日志窗口已打开, 同步刷新 (Sync the log window if it is visible)
+        if self.log_window is not None and self.log_window.isVisible():
+            self.log_window.refresh()
+
+    def open_log_window(self):
+        """打开日志窗口 (复用并提至前台, 不弹新窗口)
+        Open the log window (reuse & raise to front, no new window)."""
+        if self.log_window is None:
+            self.log_window = LogWindow(self)
+        self.log_window.show()
+        self.log_window.raise_()
+        self.log_window.activateWindow()
+
     def test_serial_connection(self, channel):
         """测试连接（串口和网络）"""
         input_text = self.port1_input.text().strip() if channel == 1 else self.port2_input.text().strip()   # 获取输入内容
@@ -1060,10 +1788,12 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                 QMessageBox.information(self, "Test Successful", f"{channel_name} Serial Port Test Successful!")
                 self.save_status_label.setText(f"{channel_name} Serial Port Test: Successful")
                 self.save_status_label.setStyleSheet("color: green;")
+                self.log_bus.log("INFO", f"Channel {channel} serial port test successful")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"{channel_name} Serial Port Test Failed: {str(e)}")
                 self.save_status_label.setText(f"{channel_name} Serial Port Test: Failed - {str(e)}")
                 self.save_status_label.setStyleSheet("color: red;")
+                self.log_bus.log("WARNING", f"Channel {channel} serial port test failed: {e}")
         
         else:
             # 网络测试
@@ -1083,16 +1813,19 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                 QMessageBox.information(self, "Connect Successful", f"{channel_name} Network Connect Successful!")
                 self.save_status_label.setText(f"{channel_name} Network Test: Successful")
                 self.save_status_label.setStyleSheet("color: green;")
+                self.log_bus.log("INFO", f"Channel {channel} network test successful")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"{channel_name} Network Test Failed: {str(e)}")
                 self.save_status_label.setText(f"{channel_name} Network Test: Failed - {str(e)}")
                 self.save_status_label.setStyleSheet("color: red;")
+                self.log_bus.log("WARNING", f"Channel {channel} network test failed: {e}")
 
     
     def file_mode_changed(self, index):
         """文件模式改变时的处理"""
         self.file_mode = "append" if index == 0 else "overwrite"
         print(f"File Mode Changed to: {self.file_mode}")
+        self.log_bus.log("INFO", f"File mode set to {self.file_mode}")
     
     def browse_file(self):
         """浏览并选择保存文件"""
@@ -1172,6 +1905,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.save_status_label.setText(f"Save Status: File Open Failed - {str(e)}")
             self.save_status_label.setStyleSheet("color: red;")
             print(f"Failed to Open Data File: {e}")
+            self.log_bus.log("ERROR", f"Data file open failed: {e}")
             return False
     
     def close_data_file(self):
@@ -1185,6 +1919,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                 self.save_status_label.setText(f"Save Status: File Close Failed - {str(e)}")
                 self.save_status_label.setStyleSheet("color: red;")
                 print(f"Failed to Close Data File: {e}")
+                self.log_bus.log("ERROR", f"Data file close failed: {e}")
             finally:
                 self.file_handle = None
     
@@ -1211,6 +1946,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         # 检查文件是否为空
         if os.path.exists(self.filename) and os.path.getsize(self.filename) == 0:
             QMessageBox.critical(self, "Error", "Data File is Empty, Cannot Create Snapshot!")
+            self.log_bus.log("WARNING", "Snapshot failed: data file empty")
             return
     
         # 确保文件已刷新
@@ -1263,6 +1999,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.save_status_label.setStyleSheet("color: blue;")
             
             print(f"Data Snapshot Created: {snapshot_file}")
+            self.log_bus.log("INFO", f"Snapshot created: {os.path.basename(snapshot_file)}")
             return True
             
         except Exception as e:
@@ -1271,6 +2008,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.save_status_label.setText(f"Snapshot Status: {error_msg}")
             self.save_status_label.setStyleSheet("color: red;")
             print(f"Failed to Create Data Snapshot: {e}")
+            self.log_bus.log("ERROR", f"Snapshot failed: {e}")
             return False
         
     def extract_number_from_filename(self, filename):
@@ -1335,8 +2073,9 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
 
             self.test_serial1_button.setText("Test Port 1")
             self.test_serial2_button.setText("Test Port 2")
-            
+
         print(f"Switched to {mode} mode")
+        self.log_bus.log("INFO", f"Connection mode switched to {mode}")
 
     def send_data(self, channel):
         """发送数据请求到指定通道"""
@@ -1361,7 +2100,8 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                     sock.sendall(request)                
         except Exception as e:
             print(f"Failed to Send Request to Channel {channel}: {e}")
-    
+            self.log_bus.log("WARNING", f"Channel {channel} send request failed: {e}")
+
     def recv_data(self, channel):
         """接收并解析指定通道的数据"""
         try:
@@ -1401,16 +2141,30 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         """获取当前时间戳"""
         return time.time()
     
-    def start_monitoring(self):
-        """开始监控"""
+    def start_monitoring(self, source="manual"):
+        """开始监控
+        source: 'manual' / 'daq_master' / 'gddaq' — 标识触发来源, 用于日志"""
+        # GDDAQ 模式下启动前再次校验数据目录有效性 (勾选后目录可能被删除/卸载)
+        # Re-validate GDDAQ data directory before starting (it may have become invalid)
+        if self.active_daq_mode == "gddaq":
+            if not self.gddaq_search_dir or not os.path.isdir(self.gddaq_search_dir):
+                self.log_bus.log("ERROR", "Start failed: GDDAQ data directory invalid")
+                QMessageBox.critical(self, "Error",
+                    f"GDDAQ data directory is invalid:\n"
+                    f"{self.gddaq_search_dir or '(not set)'}\n"
+                    "Monitoring cannot start. Please check GDDAQ Settings.")
+                return
+
         # 获取串口名/网络地址
         addr1 = self.port1_input.text().strip()
         addr2 = self.port2_input.text().strip()
         
         if not addr1:
+            self.log_bus.log("WARNING", "Start failed: Channel 1 configuration empty")
             QMessageBox.warning(self, "Warning", "Please Enter Channel 1 Configuration!")
             return
         if not self.single_channel_mode and not addr2:
+            self.log_bus.log("WARNING", "Start failed: Channel 2 configuration empty")
             QMessageBox.warning(self, "Warning", "Please Enter Channel 2 Configuration!")
             return
             
@@ -1443,11 +2197,13 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                     self.socket2.connect((ip2, int(p2)))
 
         except Exception as e:
+            self.log_bus.log("ERROR", f"Start failed: connection: {e}")
             QMessageBox.critical(self, "Error", f"Connection Failed: {e}")
             return
 
         # 打开数据文件
         if not self.open_data_file():
+            self.log_bus.log("ERROR", "Start failed: cannot open data file")
             QMessageBox.critical(self, "Error", "Cannot Open Data File, Monitoring Cannot Start!")
             return
         
@@ -1500,9 +2256,11 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         # 重新启动数据更新定时器
         self.timer.start(self.update_interval)                        
         print("Monitoring Started")
+        self.log_bus.log("INFO", f"Monitoring started ({source})")
     
-    def stop_monitoring(self):
-        """停止监控"""
+    def stop_monitoring(self, source="manual"):
+        """停止监控
+        source: 'manual' / 'daq_master' / 'gddaq' / 'daq_disabled' — 标识触发来源"""
 
         self.monitor1.stop()
         self.monitor2.stop()
@@ -1511,6 +2269,12 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
 
         self.run_stat = False
         self.timer.stop()  # 先停定时器，防止继续调用 send/recv
+
+        # 重置 recv 去抖计数器 (Reset recv debounce counters)
+        self.recv_none_count_1 = 0
+        self.recv_none_count_2 = 0
+        self.recv_warned_1 = False
+        self.recv_warned_2 = False
 
         # 关闭串口
         if self.serialport1.is_open:
@@ -1568,6 +2332,11 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         # 停止脉冲提醒定时器
         if self.pulse_reminder_timer.isActive():
             self.pulse_reminder_timer.stop()
+
+        # 停止 ZERO 报警音
+        if self.alarm_active:
+            self.alarm_timer.stop()
+            self.alarm_active = False
         
         # 自动更新文件名为下一个序号
         current_filename = self.filename_input.text().strip()
@@ -1579,6 +2348,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         self.filename = next_filename
         
         print(f"Monitoring Stopped")
+        self.log_bus.log("INFO", f"Monitoring stopped ({source})")
 
     def open_data_folder(self):
         """打开数据文件所在的文件夹"""
@@ -1595,6 +2365,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         # 检查目录是否存在
         if not dir_path or not os.path.exists(dir_path):
             QMessageBox.warning(self, "Warning", "Directory Does Not Exist, Please Select a Valid Save Location First")
+            self.log_bus.log("WARNING", "Cannot open folder: directory does not exist")
             return
         
         try:
@@ -1607,6 +2378,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                 os.system(f'xdg-open "{dir_path}"')
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Cannot Open Folder: {str(e)}")
+            self.log_bus.log("WARNING", f"Cannot open folder: {e}")
 
     def set_channel_units(self):
         """设置两个通道的单位"""
@@ -1661,6 +2433,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.canvas.draw()
             
             print(f"Units set to: Ch1={self.unit_ch1}, Ch2={self.unit_ch2}")
+            self.log_bus.log("INFO", f"Channel units set: Ch1={self.unit_ch1}, Ch2={self.unit_ch2}")
 
     def set_update_interval(self):
         """设置更新间隔对话框"""
@@ -1706,6 +2479,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                 )
             
             print(f"Update interval changed to: {interval}ms")
+            self.log_bus.log("INFO", f"Update interval set to {interval}ms")
 
     # 设置波特率的逻辑函数
     def set_baud_rate(self):
@@ -1739,23 +2513,32 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             QMessageBox.information(
                 self, 
                 "Baud Rate Set", 
-                f"Baud Rate has been set to {self.baud_rate}.\\n"
+                f"Baud Rate has been set to {self.baud_rate}.\n"
                 f"This will take effect when monitoring starts."
             )
             print(f"Baud Rate changed to: {self.baud_rate}")
+            self.log_bus.log("INFO", f"Baud rate set to {self.baud_rate}")
 
     def open_monitor_settings(self):
         """打开状态监控设置对话框"""
         dialog = MonitorSettingsDialog(
             self.monitor1, self.monitor2, 
             self.unit_ch1, self.unit_ch2, 
+            self.alarm_enabled,
             self
         )
         if dialog.exec_():
+            # 读取报警音开关
+            self.alarm_enabled = dialog.alarm_cb.isChecked()
+            # 如果关闭了报警音，立即停止正在响的报警
+            if not self.alarm_enabled and self.alarm_active:
+                self.alarm_timer.stop()
+                self.alarm_active = False
             # 设置应用后，立即更新 Monitor 的采样率参数 (以防窗口时间改变)
             self.monitor1.update_params(self.update_interval)
             self.monitor2.update_params(self.update_interval)
-            print("Monitor settings updated.")
+            print(f"Monitor settings updated. Alarm sound: {'on' if self.alarm_enabled else 'off'}.")
+            self.log_bus.log("INFO", "Status monitor settings applied")
 
     def set_current_threshold(self):
         """设置电流过滤阈值对话框"""
@@ -1827,12 +2610,37 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.limit_ch2_ma = val2 * self.unit_factors[unit2]
             
             print(f"Thresholds Updated: Ch1={self.limit_ch1_ma} mA, Ch2={self.limit_ch2_ma} mA")
-            
+            self.log_bus.log("INFO", f"Current filter thresholds set: Ch1={self.limit_ch1_ma} mA, Ch2={self.limit_ch2_ma} mA")
+
             # 状态栏反馈
-            QMessageBox.information(self, "Updated", 
+            QMessageBox.information(self, "Updated",
                                   f"Filter Thresholds Set:\n"
                                   f"Ch1: {self.limit_ch1_ma} mA\n"
                                   f"Ch2: {self.limit_ch2_ma} mA")
+
+    def on_alarm_tick(self):
+        """ZERO 报警音定时器回调：每3秒响一次"""
+        QApplication.beep()
+
+    def update_alarm_state(self, state1, state2):
+        """根据通道状态更新报警音：任一通道为 ZERO 时响"""
+        if not self.alarm_enabled:
+            if self.alarm_active:
+                self.alarm_timer.stop()
+                self.alarm_active = False
+            return
+
+        any_zero = (state1 == "ZERO") or (state2 == "ZERO")
+
+        if any_zero and not self.alarm_active:
+            # 开始报警
+            self.alarm_active = True
+            QApplication.beep()  # 立即响一声
+            self.alarm_timer.start()
+        elif not any_zero and self.alarm_active:
+            # 停止报警
+            self.alarm_timer.stop()
+            self.alarm_active = False
 
     def toggle_pulse_reminder(self):
         """切换脉冲提醒开关"""
@@ -2051,7 +2859,19 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         return closest_point
 
     def show_about(self):
-        """显示关于对话框"""
+        """显示关于对话框 (非模态, 单实例复用)
+
+        若 About 对话框已存在 (即此前打开过、未被销毁)，则前置显示已存在的窗口，
+        不重复创建。否则新建对话框并存入 self._about_dialog，以 show() 非模态弹出，
+        允许用户在保留对话框打开的同时操作主程序。
+        """
+        # 单实例复用: 已打开则前置显示 (single-instance reuse: raise existing window)
+        if self._about_dialog is not None:
+            self._about_dialog.show()
+            self._about_dialog.raise_()
+            self._about_dialog.activateWindow()
+            return
+
         about_dialog = QDialog(self)
         about_dialog.setWindowTitle("About")
         about_dialog.setFixedSize(520, 450)
@@ -2174,12 +2994,26 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         
         # 设置对话框布局
         about_dialog.setLayout(layout)
-        
-        # 显示对话框
-        about_dialog.exec_()
+
+        # 保存单实例引用, 非模态弹出 (store singleton ref, modeless show)
+        # QDialog 默认 windowModality 为 Qt.NonModal, show() 立即返回不阻塞主事件循环
+        self._about_dialog = about_dialog
+        about_dialog.show()
 
     def show_tutorial(self):
-        """显示教程对话框"""
+        """显示教程对话框 (非模态, 单实例复用)
+
+        若 Tutorial 对话框已存在 (即此前打开过、未被销毁)，则前置显示已存在的窗口，
+        不重复创建。否则新建对话框并存入 self._tutorial_dialog，以 show() 非模态弹出，
+        允许用户在保留对话框打开的同时操作主程序。
+        """
+        # 单实例复用: 已打开则前置显示 (single-instance reuse: raise existing window)
+        if self._tutorial_dialog is not None:
+            self._tutorial_dialog.show()
+            self._tutorial_dialog.raise_()
+            self._tutorial_dialog.activateWindow()
+            return
+
         dialog = QDialog(self)
         dialog.setWindowTitle("Tutorial")
         dialog.setFixedSize(600, 500)
@@ -2204,12 +3038,16 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         layout.addWidget(text_browser)
         layout.addWidget(close_button)
         dialog.setLayout(layout)
-        
-        dialog.exec_()
+
+        # 保存单实例引用, 非模态弹出 (store singleton ref, modeless show)
+        # QDialog 默认 windowModality 为 Qt.NonModal, show() 立即返回不阻塞主事件循环
+        self._tutorial_dialog = dialog
+        dialog.show()
 
     def closeEvent(self, event):
         """关闭事件，确保资源被正确释放"""
         self.stop_monitoring()
+        self.log_bus.log("INFO", "Application closed")
         event.accept()
 
     def update_data(self):
@@ -2231,11 +3069,36 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             else:
                 current2 = 0.0
             
-            # 检查数据有效性
+            # 检查数据有效性 + recv 连续无响应去抖
+            # (Debounce recv timeouts: ~5s no data -> WARNING; resumed -> INFO)
+            recv_warn_threshold = max(50, int(5000 / self.update_interval))
+
             if current1 is None:
+                self.recv_none_count_1 += 1
+                if self.recv_none_count_1 >= recv_warn_threshold and not self.recv_warned_1:
+                    self.log_bus.log("WARNING",
+                        "Channel 1: no data for ~5s (connection issue?)")
+                    self.recv_warned_1 = True
                 return
+            else:
+                # 有效数据恢复 (Valid data resumed)
+                if self.recv_warned_1:
+                    self.log_bus.log("INFO", "Channel 1: data resumed")
+                self.recv_none_count_1 = 0
+                self.recv_warned_1 = False
+
             if not self.single_channel_mode and current2 is None:
+                self.recv_none_count_2 += 1
+                if self.recv_none_count_2 >= recv_warn_threshold and not self.recv_warned_2:
+                    self.log_bus.log("WARNING",
+                        "Channel 2: no data for ~5s (connection issue?)")
+                    self.recv_warned_2 = True
                 return
+            elif not self.single_channel_mode:
+                if self.recv_warned_2:
+                    self.log_bus.log("INFO", "Channel 2: data resumed")
+                self.recv_none_count_2 = 0
+                self.recv_warned_2 = False
             
             # 3. 数据转换：将原始读数转换为 mA，用于积分计算和文件保存
             factor1 = self.unit_factors[self.unit_ch1]
@@ -2379,7 +3242,11 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                     state2 = self.monitor2.process(current2)
                     self.status_label2.set_status(state2)
                 else:
+                    state2 = "STOP"
                     self.status_label2.set_status("STOP", "OFF")
+
+                # 更新 ZERO 报警音
+                self.update_alarm_state(state1, state2)
 
             # 9. 写入文件 (传入转换后的 mA 值，write_data_row 内部需使用 .8e 格式)
             self.write_data_row(now, runtime, current1_ma, current2_ma, integral1_float, integral2_float)
