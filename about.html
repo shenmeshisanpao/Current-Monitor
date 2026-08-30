@@ -26,15 +26,68 @@
 
 <div style="margin-left: 15px;">
 
-<h4 style="color: #4A90E2; margin-bottom: 5px;"> v1.0.0 (2026-08-30, Latest)</h4> 
-<ul style="margin-top: 5px; margin-bottom: 15px;"> 
+<h4 style="color: #4A90E2; margin-bottom: 5px;"> v1.0.0 (2026-08-30, Latest)</h4>
+<ul style="margin-top: 5px; margin-bottom: 15px;">
+    <li><b>Bug Fix — Comprehensive Code Review:</b> A full review pass over the entire codebase. Issues fixed, by category:
+        <ul style="margin-top: 5px;">
+            <li><b>Communication Reliability:</b>
+                <ul>
+                    <li>Modbus response frames are now validated (slave address, function code, exception bit, byte count, CRC); invalid frames are discarded and the RX buffer is resynchronized, preventing noise/misaligned bytes from corrupting readings.</li>
+                    <li>TCP reception now loops until a complete 9-byte frame arrives (handles packet fragmentation), detects peer disconnects, and drains stale bytes before each request to guarantee strict request&ndash;response pairing.</li>
+                    <li>Serial resynchronization waits for in-flight bytes before flushing the buffer; TCP/serial receive timeouts now scale with the update interval (prevents UI freeze at small intervals).</li>
+                    <li>Persistent CRC/format errors are logged distinctly from timeouts ("check baud rate/wiring"); send and receive error logging are debounced independently per channel so half-recovered links are still reported.</li>
+                    <li>Starting with both channels configured to the same port/address is now rejected with a clear warning.</li>
+                </ul>
+            </li>
+            <li><b>Measurement Correctness:</b>
+                <ul>
+                    <li>Charge integration no longer accumulates phantom charge across communication gaps or filtered frames (integration baseline is reset whenever a frame is dropped).</li>
+                    <li>Current validity filter is now per-channel, two-sided, and rejects NaN/Inf; a threshold of 0 disables filtering instead of silently dropping all data.</li>
+                    <li>Status Monitor thresholds are stored internally in mA; switching display units no longer shifts threshold semantics. History is updated during ZERO state so recovery no longer triggers a false PEAK.</li>
+                    <li>Filename parsing strips only the trailing ".csv" (paths containing ".csv" in directory names are no longer corrupted); filename wrap-around (9999&rarr;0000) skips existing files instead of appending into ancient runs.</li>
+                </ul>
+            </li>
+            <li><b>Robustness &amp; Lifecycle:</b>
+                <ul>
+                    <li>Serial ports and sockets are rolled back if startup fails midway; "Test Port" buttons and port inputs are disabled while monitoring; filename/mode controls are disabled during a run (DAQ-linked state respected).</li>
+                    <li>Closing the app without a run no longer auto-increments the filename; DAQ/GDDAQ polling timers are stopped on exit.</li>
+                    <li>GDDAQ auto-start failure rolls back to IDLE so the next poll retries instead of skipping the run; GDDAQ run number input is validated; run.log is re-parsed only when modified.</li>
+                    <li>Recv-timeout warning threshold fixed for slow sample intervals (was up to 250s, now ~5s); channel timeout states are tracked independently.</li>
+                    <li>Pulse reminder dialog is modeless (acquisition keeps running) and destroyed on close (no hidden-dialog accumulation); DAQ_Master START forces append mode (no modal dialog inside timer callbacks); GDDAQ directory errors no longer block the polling timer with modal dialogs.</li>
+                    <li>Single-instance lock is per-user and no longer truncates the running instance's PID; pgrep subprocess has a timeout; snapshot filenames are deduplicated within the same second.</li>
+                </ul>
+            </li>
+            <li><b>Security:</b>
+                <ul>
+                    <li>"Open Data Folder" now invokes the OS handler via subprocess arguments instead of a shell command, eliminating command injection via paths derived from the DAQ status file.</li>
+                </ul>
+            </li>
+            <li><b>Code Quality &amp; Performance:</b>
+                <ul>
+                    <li>float conversion rewritten with struct (ctypes removed); bare <code>except:</code> clauses replaced; dead code removed (unreachable branches, unused attributes/variables).</li>
+                    <li>Plot redraws use <code>draw_idle()</code>; X-axis tick labels are computed only for tick positions; hover closest-point search is vectorized with NumPy; persistent failures no longer flood stdout with tracebacks.</li>
+                    <li>Resource paths unified via <code>resource_path()</code> (works from any launch directory and in PyInstaller builds); settings dialog no longer relies on fragile layout indices; snapshot metadata uses live values instead of re-parsing UI labels; path auto-completion models use <code>QFileSystemModel</code>.</li>
+                </ul>
+            </li>
+        </ul>
+    </li>
+    <li><b>Bug Fix — DAQ Link Mode Hardening:</b>
+        <ul style="margin-top: 5px;">
+            <li>DAQ_Master mode is now blocked on Windows with a clear warning (the <code>/tmp/daq_status.txt</code> status file is Linux-only), matching the existing GDDAQ behavior.</li>
+            <li>DAQ link menu entries (DAQ_Master / GDDAQ / GDDAQ Settings) are now disabled while monitoring is running, consistent with other run-time configuration locks; enabling one link mode disables the other mode's menu entry until it is turned off.</li>
+            <li>The run trigger source is now tracked: DAQ STOP signals and unchecking a DAQ link mode only stop runs started by that DAQ system — manually started runs are no longer interrupted.</li>
+            <li>DAQ_Master no longer misses the first signal if the status file was deleted and later restored with a preserved (older) timestamp; the modification-time baseline is reset whenever the file is absent.</li>
+        </ul>
+    </li>
     <li>DAQ Integration Overhaul: Restructured "Connect to DAQ" into a submenu with two mutually exclusive options: DAQ_Master (renamed from "Connect to DAQ (beta)") and GDDAQ (new).</li>
     <li>GDDAQ Support: Added automatic start/stop synchronization with GDDAQ acquisition system by monitoring <code>run.log</code> files. Includes crash detection via <code>pgrep</code> process monitoring.</li>
     <li>GDDAQ Settings: Added a configuration dialog for GDDAQ data directory, process name, and target run number.</li>
     <li>Pulse Reminder: Changed default state from enabled to disabled.</li>
+    <li>Path Auto-Completion: The "Save File Name" input and the GDDAQ data-directory input now offer path auto-completion (QCompleter + QFileSystemModel).</li>
+    <li>Non-modal About &amp; Tutorial: The About and Tutorial dialogs are now non-modal and single-instance — they stay open while you operate the main window, and re-opening raises the existing window instead of stacking a new one.</li>
     <li>Status Monitor Pulse Mode: Added "Pulse Mode" option in Status Monitor Settings. When enabled, spike detection (PEAK/DROP) is skipped and only signal loss is monitored.</li>
     <li>ZERO Alarm Sound: Added an audible alarm when any channel enters ZERO state. Can be toggled on/off in Status Monitor Settings (enabled by default).</li>
-    <li>Event Log Bar: Added a one-line log bar at the bottom of the main window (below the plot area), showing the most recent event. Click it to open the Event locking window.</li>
+    <li>Event Log Bar: Added a one-line log bar at the bottom of the main window (below the plot area), showing the most recent event. Click it to open the Event log window.</li>
     <li>Event Log Window: It records up to 100 events since startup. Logs are kept in memory only and are cleared on exit.</li>
     <li>Log Severity Colors: Entries are formatted as <code>[time] [level] message</code> and color-coded by importance.</li>
     <li>Bug Fix — DC Mode ZERO Auto-Recovery: Fixed an issue where the Status Monitor indicator stayed red indefinitely after a ZERO warning in DC mode, even after current recovered.</li>

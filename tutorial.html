@@ -988,6 +988,9 @@ body {padding: 2em;}
 <h3>1.将电流表通电，然后连接到电脑的USB口，或通过串口服务器TCP Server将数据通过网络传输。</h3>
 <h3>2. 在菜单栏"Connection"选择串口模式还是TCP网络模式。</h3>
 <h3>3. 在主界面"Channel 1 ..."和"Channel 2 ..."后分别填入连接电流表的两个USB串口名或IP地址和端口，点击后面的"Test"按钮进行连接测试。如果只有一个电流表，可在菜单栏"Run"-"Single Channel Mode (CH1 Only)"切换到单表模式，此时仅Channel 1可用。</h3>
+<blockquote>
+<p><strong>注意</strong>：双通道模式下，两个通道不能填写相同的串口名或 IP:Port（两路请求会在同一总线上交错，导致数据错乱且难以排查），程序会拒绝这样的配置并给出提示。</p>
+</blockquote>
 <ul>
 <li><strong>获取USB串口名的方法如下：</strong></li>
 </ul>
@@ -1007,7 +1010,7 @@ body {padding: 2em;}
 </ul>
 <p>查看串口服务器的后台设置。</p>
 <h3>4. 在"Save File Name"处设置记录文件的位置和文件名，默认保存在“程序文件夹/Run_0000.csv“。如果记录文件已存在，可以在"File Mode"处选择追加或覆盖，默认为追加模式。</h3>
-<h3>5. 准备就绪，点击"Start Monitoring"按钮（Ctrl+R）开始监控。程序会自动积分电荷量、自动保存到文件。</h3>
+<h3>5. 准备就绪，点击"Start Monitoring"按钮（Ctrl+R）开始监控。程序会自动积分电荷量、自动保存到文件。监控运行期间，端口输入框、"Test"按钮、文件名/浏览/保存模式等控件会被禁用（本次运行的配置已锁定，修改不会生效），停止监控后自动恢复。</h3>
 <h3>6. 点击"Stop Monitoring"（Ctrl+T）按钮停止监控。如果文件名是以四位数字为结尾的话，停止监控后，会自动 +1。</h3>
 <h3>7. 若要继续，重复第4-6步。</h3>
 <h2>额外功能</h2>
@@ -1034,7 +1037,7 @@ body {padding: 2em;}
 <p>在菜单栏"Run"-"Set Channel Units"中可以设置电流表的单位(mA, μA, nA)。</p>
 </li>
 <li>
-<p>在菜单栏"Run"-"Set Current Threshold"中可以设置电流阈值，如果读数超过阈值，将被视为无效而不记录。</p>
+<p>在菜单栏"Run"-"Set Current Threshold"中可以为每个通道设置电流过滤阈值。读数换算为 mA 后与阈值比较：绝对值超过阈值、或为 NaN/Inf 的无效读数将被丢弃，不显示、不计入电荷积分、不写入文件。过滤以帧为单位：任一通道的读数无效时整帧丢弃，以保证 CSV 中双通道数据对齐。阈值设为 <strong>0 表示禁用该通道的过滤</strong>。</p>
 </li>
 <li>
 <p>在菜单栏"Run"-"Connect to DAQ"下可选择与获取程序联动，实现同步启停和自动命名保存文件。提供两种互斥的联动模式，同一时间只能启用一种，也可都不启用。</p>
@@ -1051,7 +1054,7 @@ body {padding: 2em;}
 </ul>
 <p>启用后程序会每秒轮询指定轮次的<code>run.log</code>文件，解析其中的<code>Start:</code>和<code>Stop</code>行来判断状态：</p>
 <ul>
-<li>检测到<code>Start</code>行且进程存活 → 自动开始电流监控。</li>
+<li>检测到<code>Start</code>行且进程存活 → 自动开始电流监控。若自动开始失败（如串口被占用），程序会保持等待并在下一秒自动重试，状态栏以橙色提示"start failed, retrying..."。</li>
 <li>检测到<code>Stop</code>行 → 自动停止电流监控。</li>
 <li>进程消失（<code>pgrep</code>失败）且<code>run.log</code>中无<code>Stop</code>行 → 判定为崩溃，自动停止监控并在状态栏提示"CRASHED"。</li>
 </ul>
@@ -1129,6 +1132,9 @@ body {padding: 2em;}
 </li>
 <li>
 <p>若某个通道连续约 5 秒没有收到有效数据（例如串口线松动），会记录一条 WARNING；数据恢复正常后再记录一条 INFO。该提示经过去抖处理，不会因偶发丢包而反复刷屏。</p>
+</li>
+<li>
+<p>若某通道持续收到 CRC 校验或帧格式错误的响应（约 5 秒以上），会记录一条 WARNING 提示"repeated frame CRC/format errors (check baud rate/wiring)"，与无数据超时的警告相区分，便于定位波特率不匹配或接线问题；恢复正常后记录一条 INFO。该提示同样经过去抖处理。</p>
 </li>
 <li>
 <p>注意：状态监控（Status Monitor）的 PEAK/DROP/ZERO 告警<strong>不会</strong>记入日志，仍仅由主界面上的状态指示灯显示；CSV 逐行写入、绘图刷新等高频操作同样不记录，以免日志被迅速填满。</p>
