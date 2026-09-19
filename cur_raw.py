@@ -963,6 +963,22 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         self.gddaq_last_log_mtime = 0       # run.log 上次 mtime
         self.gddaq_last_alive_time = None   # 进程最后存活时刻 (崩溃时冻结计时)
         self.gddaq_dir_invalid_logged = False  # 数据目录失效日志去重标志 (每 run 只记一次)
+        # 进程存活上次状态 (None=本次启用后尚未检测; 用于进程出现/退出的边沿检测日志)
+        # (Last process-liveness state, None = not yet polled since enabling;
+        #  used for edge detection so process start/exit gets logged once)
+        self.gddaq_proc_alive_last = None
+        # 同文件夹重启取数跟踪 (GUI-Qt 20260709 实测: 重启取数不写新的 Start 行,
+        # 仅在该段结束时追加一个 Stop 块; 取数期间数据文件按 ~5MB 块持续落盘,
+        # 因此"数据文件比 run.log 新"是唯一的"取数进行中"信号, 检测有天然滞后)
+        # (Same-folder restart tracking: restarts write no new Start line, only
+        #  append a Stop block at the end; data files keep flushing in ~5MB
+        #  chunks while acquiring, so "data files newer than run.log" is the
+        #  only in-progress signal — detection is inherently delayed)
+        self.gddaq_follow_stop_count = 0    # 开始跟随当前取数段时的 Stop 块总数
+        self.gddaq_fin_stop_count = 0       # 进入 FINISHED 时的 Stop 块总数 (漏段检测基准)
+        self.gddaq_finished_since = None    # 进入 FINISHED 的时刻 (重启检测宽限期基准)
+        self.gddaq_restart_eps = 2.0        # 数据文件需比 run.log 新多少秒才算取数中 (秒)
+        self.gddaq_restart_grace = 10.0     # Stop 后的重启检测宽限期 (秒), 规避收尾写入顺序抖动
         # run.log 解析缓存: 仅 mtime 变化时重新解析, 避免每秒全量读文件
         # (Parse cache: re-parse only when the log's mtime changes)
         self._gddaq_last_run_dir = None
@@ -1423,8 +1439,12 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.gddaq_last_log_mtime = 0
             self.gddaq_last_alive_time = None
             self.gddaq_dir_invalid_logged = False  # 重置目录失效去重标志
+            self.gddaq_proc_alive_last = None     # 重置进程存活边沿检测基准 (reset liveness baseline)
             self._gddaq_last_run_dir = None        # 重置 run.log 解析缓存 (reset parse cache)
             self._gddaq_last_parse = None
+            self.gddaq_follow_stop_count = 0       # 重置重启取数跟踪状态 (reset restart tracking)
+            self.gddaq_fin_stop_count = 0
+            self.gddaq_finished_since = None
 
             self.gddaq_timer.start()
             print("GDDAQ Connection Enabled: Monitoring started.")
@@ -1435,6 +1455,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             # 关闭模式
             self.gddaq_timer.stop()
             self.active_daq_mode = None
+            self.gddaq_proc_alive_last = None     # 清除进程存活边沿检测基准 (clear liveness baseline)
             self.daq_connect_action.setEnabled(True)   # 恢复对方入口
 
             # 如果当前运行由 GDDAQ 触发, 联动停止; 手动启动的运行不受影响
@@ -1504,18 +1525,59 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         except Exception as e:
             return None, str(e)
 
+    def _gddaq_max_data_mtime(self, run_dir):
+        """
+        返回 run 文件夹内除 run.log 外所有文件的最新 mtime (无可用文件返回 0.0)。
+        用于同文件夹重启取数的检测: gddaq (GUI-Qt 20260709) 重启取数时不写新的
+        Start 行, 但取数期间数据文件会持续落盘 (约每 5MB 一块), 因此
+        "数据文件比 run.log 新"即代表有取数正在进行 (存在最长约一个落盘周期的滞后)。
+        实测: 数据文件与 run.log 同文件夹存放, 命名如 data_R0539_M00.bin
+        (多采集卡时为 M00/M01/... 多个), 文件夹内正常只有数据文件和 log 两类;
+        停止取数时不足一块的剩余数据会与 Stop 块几乎同时写出 (由 2s 阈值 +
+        10s 宽限期吸收, 不会误触发重启检测)。
+        (Newest mtime among files other than run.log, 0.0 if none. Restarts
+        append no new Start line, so data files newer than run.log are the
+        only 'acquisition in progress' signal, lagging by up to one flush.
+        Data files live beside run.log as data_R<run>_M<mod>.bin; the final
+        sub-block flush lands together with the Stop block, absorbed by the
+        2s epsilon + 10s grace so it never falsely reads as a restart.)
+        """
+        max_mtime = 0.0
+        try:
+            for name in os.listdir(run_dir):
+                if name == "run.log":
+                    continue
+                path = os.path.join(run_dir, name)
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    continue
+                if mtime > max_mtime:
+                    max_mtime = mtime
+        except OSError:
+            pass
+        return max_mtime
+
     def parse_gddaq_run_log(self, log_path):
         """
-        解析 run.log 文件，返回 (start_time, stop_time)。
+        解析 run.log 文件，返回 (start_time, stop_time, stop_count)。
         参考 run_timer.py 的解析逻辑:
         - 一个 run.log 可能含多个 Start/Stop 块 (重跑场景)，只取最后一个 Start 及其后是否有 Stop
         - Start 行格式: "Start: 2025-12-10 17:21:49"
         - Stop 行格式: "Stop : 2025-12-10 17:21:47" (注意 Stop 后有空格，用 split(":", 1) 处理)
         - 新的 Start 会使其之前的 Stop 失效
-        返回 (datetime, datetime or None)，解析失败返回 (None, None)
+        - stop_count 为文件中成功解析出的 Stop 块总数 (含最后一个 Start 之前的),
+          用于检测同文件夹重启取数追加的新 Stop 块
+        实测 (GUI-Qt 20260709 版): 同一 run 文件夹内重启取数时 gddaq 不会写入新的
+        Start 行, 只在该段结束时追加一个 Stop 块 —— 重启的"开始"在 run.log 中不可见,
+        只能依靠数据文件活动检测 (见 _gddaq_max_data_mtime)。
+        返回 (datetime, datetime or None, int)，解析失败返回 (None, None, 0)
         """
         start_time = None
         stop_time = None
+        stop_count = 0
 
         try:
             with open(log_path, "r") as f:
@@ -1537,12 +1599,13 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                             t_str = parts[1].strip()
                             try:
                                 stop_time = datetime.strptime(t_str, "%Y-%m-%d %H:%M:%S")
+                                stop_count += 1
                             except ValueError:
                                 pass
         except Exception:
             pass
 
-        return start_time, stop_time
+        return start_time, stop_time, stop_count
 
     def check_gddaq_status(self):
         """
@@ -1551,6 +1614,9 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         - IDLE → 检测到 Start 且无 Stop → RUNNING (自动 start_monitoring)
         - RUNNING → 检测到 Stop → FINISHED (自动 stop_monitoring)
         - RUNNING → pgrep 失败且无 Stop → CRASHED (自动 stop_monitoring，状态栏提示)
+        - FINISHED → 数据文件比 run.log 新且进程存活 → RUNNING (同文件夹重启取数,
+          自动 start_monitoring 并追加到同一 CSV; 受 ~5MB 落盘缓冲影响检测有滞后)
+        - FINISHED → 出现新 Stop 块但未检测到取数活动 → 记录 WARNING (漏掉的取数段)
         - 每次轮询记录上次状态，避免重复触发启停
         """
         try:
@@ -1604,10 +1670,23 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             #    (Re-parse only when the log changed; avoids re-reading every second)
             if log_changed or self._gddaq_last_parse is None:
                 self._gddaq_last_parse = self.parse_gddaq_run_log(log_path)
-            start_time, stop_time = self._gddaq_last_parse
+            start_time, stop_time, stop_count = self._gddaq_last_parse
 
             # 4. 检测进程存活
             proc_alive = self.is_gddaq_running()
+
+            # 4b. 进程存活边沿检测: 跳变时记录日志 (不依赖状态机分支, 任何状态下
+            #     进程出现/退出都能留痕; 首次轮询 None→False 不记录, 避免噪音)
+            #     (Edge detection on process liveness: log on transitions regardless
+            #     of the state machine; first poll None→False is not logged)
+            if self.gddaq_proc_alive_last is not None and self.gddaq_proc_alive_last != proc_alive:
+                if proc_alive:
+                    print(f"GDDAQ: process '{self.gddaq_proc_name}' detected")
+                    self.log_bus.log("INFO", f"GDDAQ: process '{self.gddaq_proc_name}' detected")
+                else:
+                    print(f"GDDAQ: process '{self.gddaq_proc_name}' is no longer running")
+                    self.log_bus.log("INFO", f"GDDAQ: process '{self.gddaq_proc_name}' is no longer running")
+            self.gddaq_proc_alive_last = proc_alive
 
             # 5. 状态判定 (参考 run_timer.py)
             now = datetime.now()
@@ -1621,15 +1700,123 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                 return
 
             if stop_time is not None:
-                # 有 Stop → 已结束
+                # ---- 有 Stop 行 ----
+                if self.gddaq_last_state == "RUNNING":
+                    # 正在跟随一段取数 (首轮或重启段)。stop_count 变化 = 追加了新的
+                    # Stop 块 → 本段结束; 进程消失且无新 Stop → 崩溃
+                    # (Following an acquisition; a changed stop_count means a
+                    #  new Stop block was appended → this segment is over)
+                    if stop_count != self.gddaq_follow_stop_count:
+                        print(f"GDDAQ: Run {run_id} segment FINISHED (new Stop block in run.log)")
+                        self.log_bus.log("INFO", f"GDDAQ: run {run_id} segment finished")
+                        self.gddaq_last_state = "FINISHED"
+                        self.gddaq_fin_stop_count = stop_count
+                        self.gddaq_finished_since = now
+                        # 只停止由 GDDAQ 触发的运行, 不干扰手动启动的运行
+                        # (Only stop runs triggered by GDDAQ; manual runs continue)
+                        if self.run_stat and self.run_source == "gddaq":
+                            self.stop_monitoring(source="gddaq")
+                        self.save_status_label.setText(f"GDDAQ: Run {run_id} Finished")
+                        self.save_status_label.setStyleSheet("color: green;")
+                    elif not proc_alive:
+                        # 跟随重启段期间进程消失且无新 Stop → 视为崩溃
+                        print(f"GDDAQ: Run {run_id} CRASHED during restarted acquisition")
+                        self.log_bus.log("WARNING",
+                            f"GDDAQ: process died during restarted acquisition (run {run_id})")
+                        self.gddaq_last_state = "CRASHED"
+                        if self.run_stat and self.run_source == "gddaq":
+                            self.stop_monitoring(source="gddaq")
+                        self.save_status_label.setText(f"GDDAQ: Run {run_id} CRASHED! Process '{self.gddaq_proc_name}' not found.")
+                        self.save_status_label.setStyleSheet("color: red;")
+                    return
+
                 if self.gddaq_last_state != "FINISHED":
+                    # 首次看到 Stop → 本轮取数结束
                     print(f"GDDAQ: Run {run_id} FINISHED (Stop detected in run.log)")
                     self.log_bus.log("INFO", f"GDDAQ: run {run_id} finished")
                     self.gddaq_last_state = "FINISHED"
-                    if self.run_stat:
+                    self.gddaq_fin_stop_count = stop_count
+                    self.gddaq_finished_since = now
+                    # 只停止由 GDDAQ 触发的运行, 不干扰手动启动的运行
+                    # (Only stop runs triggered by GDDAQ; manual runs continue)
+                    if self.run_stat and self.run_source == "gddaq":
                         self.stop_monitoring(source="gddaq")
                     self.save_status_label.setText(f"GDDAQ: Run {run_id} Finished")
                     self.save_status_label.setStyleSheet("color: green;")
+                    return
+
+                # ---- 已处于 FINISHED: 跟踪同一文件夹内的重启取数 ----
+                # (GUI-Qt 20260709: 重启取数不写新 Start 行, 只在结束时追加 Stop 块,
+                #  因此"重启已开始"只能靠数据文件活动判断)
+                # (Already FINISHED: track same-folder restarts — their start is
+                #  invisible in run.log, only data-file activity reveals them)
+
+                # a) 漏段检测: 出现了新 Stop 块, 但我们从未检测到取数活动
+                #    (段太短, 停止时的收尾落盘与 Stop 块几乎同时到达, 来不及被
+                #    轮询观察到; 多采集卡的 M00/M01... 文件取 max 不受影响)
+                if stop_count > self.gddaq_fin_stop_count:
+                    print(f"GDDAQ: Run {run_id} missed a restarted acquisition (new Stop block, no data activity seen)")
+                    self.log_bus.log("WARNING",
+                        f"GDDAQ: missed restarted acquisition in run {run_id} "
+                        f"(too short or under one data-flush block)")
+                    self.gddaq_fin_stop_count = stop_count
+                    self.gddaq_finished_since = now
+                    self.save_status_label.setText(f"GDDAQ: Run {run_id} missed a restarted acquisition!")
+                    self.save_status_label.setStyleSheet("color: orange;")
+
+                # b) 重启检测: 数据文件比 run.log 新 + 进程存活 + 已过宽限期
+                #    (宽限期用于规避取数收尾时数据落盘与 Stop 块写入的顺序抖动)
+                grace_ok = (
+                    self.gddaq_finished_since is None
+                    or (now - self.gddaq_finished_since).total_seconds() > self.gddaq_restart_grace
+                )
+                data_mtime = self._gddaq_max_data_mtime(run_dir)
+                if (proc_alive and grace_ok
+                        and data_mtime > current_log_mtime + self.gddaq_restart_eps):
+                    print(f"GDDAQ: Run {run_id} restart detected (data files newer than run.log)")
+                    self.log_bus.log("INFO", f"GDDAQ: run {run_id} restarted acquisition detected")
+                    # 先乐观置为 RUNNING; 若启动失败会在下方回退为 FINISHED 以便重试
+                    # (Tentatively RUNNING; rolled back to FINISHED below if start fails)
+                    self.gddaq_last_state = "RUNNING"
+                    self.gddaq_follow_stop_count = stop_count
+
+                    # 保存路径: 与首轮相同, 重启段追加到同一 CSV
+                    # (Same file as the first segment: restarted segments append)
+                    save_dir = os.path.join(self.gddaq_search_dir, "CurrentData")
+                    if not os.path.exists(save_dir):
+                        try:
+                            os.makedirs(save_dir, exist_ok=True)
+                        except Exception as e:
+                            print(f"GDDAQ: Error creating save directory: {e}")
+                            self.log_bus.log("ERROR", f"GDDAQ: cannot create save directory: {e}")
+                            self.gddaq_last_state = "FINISHED"
+                            return
+
+                    run_num = int(run_id)
+                    filename = f"run_{run_num:05d}.csv"
+                    full_path = os.path.join(save_dir, filename)
+
+                    if not self.run_stat:
+                        self.filename_input.setText(full_path)
+                        # 强制追加模式: 重启段追加到同一文件, 且避免在定时器回调中
+                        # 弹出模态覆盖确认框阻塞事件循环 (同 DAQ_Master 逻辑)
+                        # (Force append: segments go into one file; also avoids a
+                        #  modal overwrite-confirm dialog inside a timer callback)
+                        self.file_mode = "append"
+                        self.file_mode_combo.setCurrentIndex(0)
+                        print(f"GDDAQ: Auto-starting monitoring (restart). File: {full_path}")
+                        self.start_monitoring(source="gddaq")
+
+                    if self.run_stat:
+                        self.save_status_label.setText(f"GDDAQ: Running {filename} (restart)")
+                        self.save_status_label.setStyleSheet("color: green;")
+                    else:
+                        # 启动失败 (串口占用/文件不可写等): 回退为 FINISHED,
+                        # 下个轮询周期自动重试
+                        # (Start failed: roll back to FINISHED so the next poll retries)
+                        self.gddaq_last_state = "FINISHED"
+                        self.save_status_label.setText(f"GDDAQ: Run {run_id} start failed, retrying...")
+                        self.save_status_label.setStyleSheet("color: orange;")
                 return
 
             # 无 Stop 的情况
@@ -1643,6 +1830,9 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                     # 先乐观置为 RUNNING; 若启动失败会在下方回退为 IDLE 以便重试
                     # (Tentatively RUNNING; rolled back to IDLE below if start fails)
                     self.gddaq_last_state = "RUNNING"
+                    # 记录跟随起点: 后续 stop_count 变化即代表本段结束
+                    # (Baseline: a later change in stop_count ends this segment)
+                    self.gddaq_follow_stop_count = stop_count
 
                     # 生成保存路径: <search_dir>/CurrentData/run_<run_id:05d>.csv
                     save_dir = os.path.join(self.gddaq_search_dir, "CurrentData")
@@ -1661,6 +1851,13 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                     # 更新 UI 文件名并启动监控
                     if not self.run_stat:
                         self.filename_input.setText(full_path)
+                        # 强制追加模式 (同 DAQ_Master / 重启段逻辑): 联动文件统一追加,
+                        # 且避免在定时器回调中弹出模态覆盖确认框阻塞事件循环
+                        # (Force append, same as DAQ_Master/restart logic: linked
+                        #  files always append; also avoids a modal overwrite
+                        #  confirm inside a timer callback)
+                        self.file_mode = "append"
+                        self.file_mode_combo.setCurrentIndex(0)
                         print(f"GDDAQ: Auto-starting monitoring. File: {full_path}")
                         self.start_monitoring(source="gddaq")
 

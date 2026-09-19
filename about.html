@@ -1,7 +1,7 @@
 <div style="font-family: Arial, sans-serif; line-height: 1.6;">
 <center>
 <h2 style="color: #2E86AB; margin-bottom: 10px;">Real-Time Current Monitoring System</h2>
-<p><b>Version v1.0.0</b></p>
+<p><b>Version v1.0.1</b></p>
 <p>Compatible with 創鴻高精度智能盤面表 DM4D-An-Rs</p>
 <p><b>Developer:</b> Zhicheng Zhang</p>
 <p><b>Email:</b> <a href="mailto:zhangzhicheng@cnncmail.cn">zhangzhicheng@cnncmail.cn</a></p>
@@ -26,7 +26,14 @@
 
 <div style="margin-left: 15px;">
 
-<h4 style="color: #4A90E2; margin-bottom: 5px;"> v1.0.0 (2026-08-30, Latest)</h4>
+<h4 style="color: #4A90E2; margin-bottom: 5px;"> v1.0.1 (2026-09-18, Latest)</h4>
+<ul style="margin-top: 5px; margin-bottom: 15px;">
+    <li><b>GDDAQ Restart Tracking:</b> Same-folder restarts are detected by data files newer than run.log and auto-resumed into the same run_XXXXX.csv, with flush-delay/missed-short-segment limits, an orange hint + WARNING, a 10 s post-Stop grace and 2 s freshness threshold, and crash handling if gddaq disappears.</li>
+    <li><b>Bug Fix &mdash; GDDAQ File Mode:</b> Runs auto-started by GDDAQ now force append mode (same as DAQ_Master): a pre-existing <code>run_XXXXX.csv</code> is never silently overwritten, and no modal overwrite-confirmation dialog can appear inside the polling timer callback.</li>
+    <li><b>Bug Fix &mdash; GDDAQ Stop Scope:</b> A Stop block in <code>run.log</code> (or a process crash) now only stops runs that were auto-started by GDDAQ. Manually started monitoring is no longer interrupted, consistent with DAQ_Master behavior.</li>
+</ul>
+
+<h4 style="color: #4A90E2; margin-bottom: 5px;"> v1.0.0 (2026-08-30)</h4>
 <ul style="margin-top: 5px; margin-bottom: 15px;">
     <li><b>Bug Fix — Comprehensive Code Review:</b> A full review pass over the entire codebase. Issues fixed, by category:
         <ul style="margin-top: 5px;">
