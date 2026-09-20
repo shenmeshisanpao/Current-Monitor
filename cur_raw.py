@@ -58,6 +58,10 @@ rcParams['axes.grid'] = True
 rcParams['grid.linestyle'] = 'dotted'
 rcParams['grid.alpha'] = 0.7
 
+# 应用版本号 (与 about.html 中显示的版本保持一致)
+# Application version (kept in sync with the version shown in about.html)
+VERSION = "v1.0.1"
+
 # 单位到 mA 的转换系数 (模块级常量, 供主窗口与设置对话框共用)
 # (Unit-to-mA conversion factors, shared by the main window and settings dialogs)
 UNIT_FACTORS = {
@@ -847,7 +851,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
     def __init__(self):
         super().__init__()
         
-        self.setWindowTitle("Real-Time Current Monitoring System")
+        self.setWindowTitle(f"Real-Time Current Monitoring System {VERSION}")
 
         # 默认模式: "serial" 或 "network"
         self.connection_mode = "serial"
