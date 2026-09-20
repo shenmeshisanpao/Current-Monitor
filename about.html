@@ -26,11 +26,12 @@
 
 <div style="margin-left: 15px;">
 
-<h4 style="color: #4A90E2; margin-bottom: 5px;"> v1.0.1 (2026-09-18, Latest)</h4>
+<h4 style="color: #4A90E2; margin-bottom: 5px;"> v1.0.1 (2026-09-20, Latest)</h4>
 <ul style="margin-top: 5px; margin-bottom: 15px;">
     <li><b>GDDAQ Restart Tracking:</b> Same-folder restarts are detected by data files newer than run.log and auto-resumed into the same run_XXXXX.csv, with flush-delay/missed-short-segment limits, an orange hint + WARNING, a 10 s post-Stop grace and 2 s freshness threshold, and crash handling if gddaq disappears.</li>
     <li><b>Bug Fix &mdash; GDDAQ File Mode:</b> Runs auto-started by GDDAQ now force append mode (same as DAQ_Master): a pre-existing <code>run_XXXXX.csv</code> is never silently overwritten, and no modal overwrite-confirmation dialog can appear inside the polling timer callback.</li>
     <li><b>Bug Fix &mdash; GDDAQ Stop Scope:</b> A Stop block in <code>run.log</code> (or a process crash) now only stops runs that were auto-started by GDDAQ. Manually started monitoring is no longer interrupted, consistent with DAQ_Master behavior.</li>
+    <li><b>Link-Mode Ownership:</b> In link mode, start/stop is controlled by the external DAQ software; any manual intervention exits link mode.</li>
 </ul>
 
 <h4 style="color: #4A90E2; margin-bottom: 5px;"> v1.0.0 (2026-08-30)</h4>

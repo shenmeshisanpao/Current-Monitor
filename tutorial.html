@@ -982,7 +982,7 @@ body {padding: 2em;}
   <body>
   <div class="markdown-body">
     <h1>电流实时监控系统使用教程</h1>
-<p>本教程由 Z.C. Zhang 最后一次修改于2026年9月18日。</p>
+<p>本教程由 Z.C. Zhang 最后一次修改于2026年9月20日。</p>
 <hr>
 <h2>使用教程</h2>
 <h3>1.将电流表通电，然后连接到电脑的USB口，或通过串口服务器TCP Server将数据通过网络传输。</h3>
@@ -1060,6 +1060,9 @@ body {padding: 2em;}
 <li>同文件夹内重启取数：程序通过"数据文件比<code>run.log</code>新"来检测重启的取数段——检测到后自动再次开始电流监控，并将数据<strong>追加</strong>到该轮次的同一CSV文件中。由于gddaq的数据文件可能每积累一定大小才落盘一次，重启段的自动开始存在明显滞后（最长约一个落盘周期）。若某段取数太短、始终未触发数据落盘，则该段无法被检测到，程序会在状态栏以橙色提示并在日志中记录WARNING。</li>
 </ul>
 <p>所有电流数据文件统一保存在数据根目录下的<code>CurrentData/</code>子文件夹中（如<code>/home/rnb/Data/202605ams/raw/CurrentData/run_00048.csv</code>），不会分散到各轮次文件夹内。</p>
+</li>
+<li>
+<p><strong>联动模式下的手动启停（两种联动通用）</strong>：联动期间启停由外部获取程序主导，任何手动干预都会退出联动模式。</p>
 <blockquote>
 <p><strong>注意</strong>：使用联动模式时不建议覆盖轮次（复用同一轮次编号/文件夹重新取数）。虽然程序已能检测同文件夹内的重启取数段并追加记录，但如上所述其自动开始存在滞后、极短段可能漏检；且同一CSV文件中会混有多段数据，事后与DAQ数据一一对应时更易出错。建议每轮取数都使用新的轮次编号，让每轮取数与电流数据文件一一对应。DAQ_Master联动同理：复用相同的轮次名与编号，会把多轮数据追加进<code>current_data</code>下的同一个文件。</p>
 </blockquote>
@@ -1135,7 +1138,7 @@ body {padding: 2em;}
 <p>GDDAQ 联动模式启用期间，每当轮询检测到 GDDAQ 进程<strong>启动</strong>（出现）或<strong>退出</strong>（消失）时，会各记录一条 INFO 日志（如 <code>GDDAQ: process 'gddaq' detected</code> / <code>GDDAQ: process 'gddaq' is no longer running</code>），与状态机的轮次日志相互独立。</p>
 </li>
 <li>
-<p>其中<strong>开始和停止监控会标明触发来源</strong>，便于区分是人工操作还是联动自动触发：<code>(manual)</code> 表示手动点击按钮；<code>(daq_master)</code> 和 <code>(gddaq)</code> 分别表示由 DAQ_Master 或 GDDAQ 联动自动触发；<code>(daq_disabled)</code> 表示因取消勾选联动开关而停止。</p>
+<p>其中<strong>开始和停止监控会标明触发来源</strong>，便于区分是人工操作还是联动自动触发：<code>(manual)</code> 表示手动点击按钮；<code>(daq_master)</code> 和 <code>(gddaq)</code> 分别表示由 DAQ_Master 或 GDDAQ 联动自动触发；<code>(daq_disabled)</code> 表示因取消勾选联动开关而停止；<code>(shutdown)</code> 表示关闭程序窗口时自动停止。</p>
 </li>
 <li>
 <p>若某个通道连续约 5 秒没有收到有效数据（例如串口线松动），会记录一条 WARNING；数据恢复正常后再记录一条 INFO。该提示经过去抖处理，不会因偶发丢包而反复刷屏。</p>

@@ -952,6 +952,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         #  only parsed in a known format, and derived paths never reach a shell)
         self.daq_status_file = "/tmp/daq_status.txt"
         self.daq_last_mtime = 0
+        self.daq_master_running = False    # DAQ_Master 外部程序当前是否 RUNNING (由 check_daq_status 维护)
         self.daq_timer = QTimer()
         self.daq_timer.timeout.connect(self.check_daq_status)
         self.daq_timer.setInterval(200)  # 每200ms检查一次文件
@@ -1269,7 +1270,12 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                 #  mtime would swallow the first signal if the file is later
                 #  restored with a preserved timestamp)
                 self.daq_last_mtime = 0
-            
+
+            # 重置外部运行标志: 启用后 200ms 内首读即校准 (mtime=0 机制保证读到当前状态)
+            # (Reset the external-running flag; the first poll within 200ms
+            #  re-calibrates it, guaranteed by the mtime=0 mechanism)
+            self.daq_master_running = False
+
             self.daq_timer.start()
             print("DAQ_Master Connection Enabled: Monitoring started.")
             self.log_bus.log("INFO", "DAQ_Master auto-link enabled")
@@ -1317,6 +1323,12 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                 status_line = lines[0]
 
                 if "STATUS: RUNNING" in status_line:
+                    # 维护外部运行标志 (即使本次 START 被忽略也要更新,
+                    # 供手动停止时的确认框判断 DAQ 是否仍在取数)
+                    # (Maintain the external-running flag even when this START
+                    #  is ignored; the manual-stop confirm dialog needs it)
+                    self.daq_master_running = True
+
                     # 如果已经在运行，先不处理，或者可以选择重启监控
                     if self.run_stat:
                         print("DAQ Signal: START received, but already running. Ignoring.")
@@ -1366,6 +1378,8 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                         self.save_status_label.setStyleSheet("color: green;")
 
                 elif "STATUS: STOPPED" in status_line:
+                    self.daq_master_running = False
+
                     # 只停止由 DAQ_Master 触发的运行, 不干扰手动启动的运行
                     # (Only stop runs triggered by DAQ_Master; never interrupt
                     #  manually started runs)
@@ -1475,6 +1489,58 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.log_bus.log("INFO", "GDDAQ auto-link disabled")
             self.save_status_label.setText("GDDAQ Mode: Disabled")
             self.save_status_label.setStyleSheet("color: black;")
+
+    def _exit_active_daq_link(self, reason):
+        """手动干预导致退出联动模式 (Exit link mode due to manual intervention)
+
+        单一所有权原则: 联动期间外部 DAQ 是运行的唯一所有者, 任何手动
+        Start/Stop 干预都意味着收回所有权并退出联动模式。
+        注意: 程序化 setChecked 不触发 triggered 信号, 须显式调用 toggle
+        (遵循互斥逻辑 1247-1249 行的现有模式)。
+
+        (Single-ownership principle: while a link is active the external DAQ
+        is the sole owner of the run; any manual Start/Stop intervention takes
+        ownership back and exits link mode. Programmatic setChecked does not
+        emit 'triggered', so the toggle must be called explicitly, following
+        the existing mutual-exclusion pattern.)
+        """
+        if self.active_daq_mode == "daq_master":
+            self.log_bus.log("WARNING", f"DAQ_Master link exited: {reason}")
+            self.daq_connect_action.setChecked(False)
+            self.toggle_daq_connection()
+        elif self.active_daq_mode == "gddaq":
+            self.log_bus.log("WARNING", f"GDDAQ link exited: {reason}")
+            self.gddaq_connect_action.setChecked(False)
+            self.toggle_gddaq_connection()
+
+    def _confirm_manual_override_stop(self):
+        """联动运行中手动停止的确认 (Confirm a manual stop during a linked run)
+
+        外部 DAQ 仍在 RUNNING 时弹确认框 (停止将截断本 run 电流数据);
+        外部已停止/idle 则直接放行, 不打扰用户。
+
+        (Ask for confirmation when the external DAQ is still RUNNING, since
+        stopping truncates this run's current data; allow silently otherwise.)
+        """
+        if self.active_daq_mode == "daq_master":
+            external_running = self.daq_master_running
+            mode_name = "DAQ_Master"
+        elif self.active_daq_mode == "gddaq":
+            # FINISHED / CRASHED / IDLE 均视为外部已不在取数
+            # (FINISHED / CRASHED / IDLE all count as not acquiring)
+            external_running = (self.gddaq_last_state == "RUNNING")
+            mode_name = "GDDAQ"
+        else:
+            return True
+
+        if not external_running:
+            return True
+
+        reply = QMessageBox.question(self, "Confirm",
+            f"{mode_name} is still RUNNING.\n"
+            "Stopping will exit link mode and truncate this run's "
+            "current data. Continue?")
+        return reply == QMessageBox.Yes
 
     def is_gddaq_running(self):
         """通过 pgrep -x 检测 DAQ 进程是否存活 (参考 run_timer.py)"""
@@ -2625,6 +2691,21 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
     def start_monitoring(self, source="manual"):
         """开始监控
         source: 'manual' / 'daq_master' / 'gddaq' — 标识触发来源, 用于日志"""
+        # 联动模式下手动启动 = 收回所有权: 确认后先退出联动再启动, 取消则无事发生
+        # (In link mode a manual start means taking back ownership: confirm,
+        #  exit link mode, then start; cancelling is a no-op)
+        if source == "manual" and self.active_daq_mode is not None:
+            mode_name = "DAQ_Master" if self.active_daq_mode == "daq_master" else "GDDAQ"
+            reply = QMessageBox.question(self, "Confirm",
+                f"{mode_name} link mode is active.\n"
+                "Starting manually will exit link mode. Continue?")
+            if reply != QMessageBox.Yes:
+                self.log_bus.log("INFO", "Manual start cancelled (link mode kept)")
+                return
+            self._exit_active_daq_link("manual start")
+            # 联动已退出, 继续正常手动启动流程
+            # (Link mode exited; continue with the normal manual start flow)
+
         # GDDAQ 模式下启动前再次校验数据目录有效性 (勾选后目录可能被删除/卸载)
         # Re-validate GDDAQ data directory before starting (it may have become invalid)
         if self.active_daq_mode == "gddaq":
@@ -2819,12 +2900,20 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
 
     def stop_monitoring(self, source="manual"):
         """停止监控
-        source: 'manual' / 'daq_master' / 'gddaq' / 'daq_disabled' — 标识触发来源"""
+        source: 'manual' / 'daq_master' / 'gddaq' / 'daq_disabled' / 'shutdown' — 标识触发来源"""
         # 未运行时直接返回: 避免误触发文件名自增等清理逻辑
         # (No-op when not running: prevents unwanted filename auto-increment
         #  when e.g. closing the app without ever starting a run)
         if not self.run_stat:
             return
+
+        # 联动运行中手动停止 = 收回所有权: 外部仍在取数时弹确认框, 取消则运行继续
+        # (Manual stop during a linked run takes back ownership: confirm when
+        #  the external DAQ is still acquiring; cancelling keeps the run)
+        if source == "manual" and self.active_daq_mode is not None:
+            if not self._confirm_manual_override_stop():
+                self.log_bus.log("INFO", "Manual stop cancelled (run continues)")
+                return
 
         self.monitor1.stop()
         self.monitor2.stop()
@@ -2944,6 +3033,14 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         
         print(f"Monitoring Stopped")
         self.log_bus.log("INFO", f"Monitoring stopped ({source})")
+
+        # 手动停止后退出联动模式: 被截断的联动运行若保持联动, 后续 DAQ 信号
+        # (mtime 已错过) 会被静默漏掉, 造成数据断层 (见单一所有权原则)
+        # (Exit link mode after a manual stop: keeping the link after a
+        #  truncated run would silently miss subsequent DAQ signals — the
+        #  mtime-based START has already fired — causing data gaps)
+        if source == "manual" and self.active_daq_mode is not None:
+            self._exit_active_daq_link("manual stop")
 
     def open_data_folder(self):
         """打开数据文件所在的文件夹"""
@@ -3656,7 +3753,10 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         # 停止 DAQ/GDDAQ 轮询定时器 (Stop DAQ/GDDAQ polling timers)
         self.daq_timer.stop()
         self.gddaq_timer.stop()
-        self.stop_monitoring()
+        # shutdown 来源: 跳过手动接管确认框, 静默停止 (关闭窗口无法响应模态框)
+        # (source='shutdown' skips the manual-override confirmation: a modal
+        #  dialog cannot be answered while the window is closing)
+        self.stop_monitoring(source="shutdown")
         self.log_bus.log("INFO", "Application closed")
         event.accept()
 
