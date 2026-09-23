@@ -18,6 +18,677 @@
 
 import sys
 import os
+import re
+import struct
+import time
+import json
+
+# ======================================================================
+# GDDAQ 内存读取核心 (GDDAQ memory-read core, stdlib only)
+#
+# 本段是 "Process Memory (root)" 联动方式的全部底层实现: 定位 gddaq 进程,
+# 在其内存中找到 MainWindow/ReadoutThread 实例并读出运行状态。偏移的推导
+# 过程与反汇编证据见同目录的 gddaq_memread.py —— 该文件保留为**独立的
+# 诊断工具** (--dump/--check), 运行时不被本程序依赖。
+#
+# 关键设计: 这段代码位于所有 GUI/科学库 import **之前**, 以
+# `--gddaq-mem-helper` 命令行标志触发守护模式 —— GUI 通过
+# `sudo <本程序> --gddaq-mem-helper ...` 拉起自身的一个 root 副本, 该副本
+# 只执行下面的纯标准库循环并退出, 不加载 PyQt5/numpy 等。好处:
+#   1. root 下运行的代码面最小 (最小提权原则);
+#   2. 打包后无需目标机器安装 python3 (可执行文件自带解释器);
+#   3. 无需 --add-data 附带任何外部脚本文件。
+# (This stdlib-only core runs as the root helper: the GUI spawns
+#  `sudo <this program> --gddaq-mem-helper ...`; the root copy never
+#  imports the GUI/scientific stack. No system python3, no external
+#  script files needed in packaged builds.)
+# ======================================================================
+
+# 默认偏移 (本仓库 gddaq 二进制的实证值; 可用 --off-xxx 覆盖)
+# (Default offsets, reverse-engineered from the gddaq binary; overridable)
+GDDAQ_DEF_OFF = dict(
+    folder=0x158, prefix=0x160, run=0x168,
+    lefolder=0x170, lerun=0x180,
+    readout=0x110,
+    m_running=0x23, rt_runno=0x38,
+)
+GDDAQ_DEF_VT = dict(mainwindow=0x140fb8, readoutthread=0x141a18)  # 相对 PIE 基址
+GDDAQ_TARGET_SYMS = dict(
+    mainwindow="_ZTV10MainWindow",
+    readoutthread="_ZTV13ReadoutThread",
+)
+
+
+class ElfFile:
+    """只读 ELF 解析 (PT_LOAD / PT_DYNAMIC / .symtab), 供 vtable 符号定位"""
+
+    def __init__(self, path):
+        with open(path, "rb") as f:
+            self.d = f.read()
+        if self.d[:4] != b"\x7fELF":
+            raise ValueError("not ELF: %s" % path)
+        if self.d[4] != 2:
+            raise ValueError("only ELF64 supported")
+        self.e_phoff = struct.unpack_from("<Q", self.d, 0x20)[0]
+        self.e_phentsize = struct.unpack_from("<H", self.d, 0x36)[0]
+        self.e_phnum = struct.unpack_from("<H", self.d, 0x38)[0]
+        self.loads = []
+        self.dyn_phdr = None
+        for i in range(self.e_phnum):
+            o = self.e_phoff + i * self.e_phentsize
+            p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align = \
+                struct.unpack_from("<IIQQQQQQ", self.d, o)
+            if p_type == 1:      # PT_LOAD
+                self.loads.append((p_vaddr, p_offset, p_filesz, p_memsz))
+            elif p_type == 2:    # PT_DYNAMIC
+                self.dyn_phdr = (p_vaddr, p_offset, p_filesz)
+        self._dyn = None
+
+    def v2o(self, va):
+        for vaddr, off, fsz, msz in self.loads:
+            if vaddr <= va < vaddr + msz:
+                return off + (va - vaddr)
+        return None
+
+    def dynamic(self):
+        if self._dyn is not None:
+            return self._dyn
+        tags = {}
+        if self.dyn_phdr:
+            va, off, size = self.dyn_phdr
+            for i in range(size // 16):
+                t, v = struct.unpack_from("<QQ", self.d, off + i * 16)
+                if t == 0:
+                    break
+                tags[t] = v
+        self._dyn = tags
+        return tags
+
+    def symtab(self):
+        """从 section header 读 .symtab (vtable 这类局部符号只在这里)"""
+        try:
+            e_shoff = struct.unpack_from("<Q", self.d, 0x28)[0]
+            e_shentsize = struct.unpack_from("<H", self.d, 0x3A)[0]
+            e_shnum = struct.unpack_from("<H", self.d, 0x3C)[0]
+        except struct.error:
+            return {}
+        if not e_shoff or not e_shnum:
+            return {}
+        out = {}
+        for i in range(e_shnum):
+            o = e_shoff + i * e_shentsize
+            try:
+                nm, typ, flags, addr, off, sz, link = struct.unpack_from("<IIQQQQI", self.d, o)
+            except struct.error:
+                break
+            if typ != 2:      # SHT_SYMTAB
+                continue
+            so = e_shoff + link * e_shentsize
+            str_off = struct.unpack_from("<Q", self.d, so + 0x18)[0]
+            for k in range(sz // 24):
+                p = off + k * 24
+                if p + 24 > len(self.d):
+                    break
+                n, info, other, shx, val, size = struct.unpack_from("<IBBHQQ", self.d, p)
+                if not n:
+                    continue
+                e = self.d.find(b"\0", str_off + n)
+                name = self.d[str_off + n:e].decode(errors="replace")
+                if val:
+                    out[name] = val
+        return out
+
+
+_GDDAQ_MAPS_RE = re.compile(r"^([0-9a-f]+)-([0-9a-f]+)\s+(\S{4})\s+([0-9a-f]+)\s+\S+\s+\d+\s*(.*)$")
+
+
+def _gddaq_parse_maps(text):
+    """解析 /proc/<pid>/maps (设备号第 4 格、inode 第 5 格、路径才是第 6 格)"""
+    out = []
+    for ln in text.splitlines():
+        m = _GDDAQ_MAPS_RE.match(ln)
+        if not m:
+            continue
+        lo, hi, perms, off, path = m.groups()
+        path = path.strip()
+        if path.endswith("(deleted)"):
+            path = path[: -len("(deleted)")].rstrip()
+        out.append(dict(lo=int(lo, 16), hi=int(hi, 16), perms=perms,
+                        off=int(off, 16), path=path))
+    return out
+
+
+class ProcMem:
+    """只读 /proc/<pid>/mem, 不 ptrace attach, 不会暂停目标进程"""
+
+    def __init__(self, pid):
+        self.pid = pid
+        self.fd = os.open("/proc/%d/mem" % pid, os.O_RDONLY)
+        self.maps = self._read_maps()
+
+    def _read_maps(self):
+        try:
+            with open("/proc/%d/maps" % self.pid) as f:
+                return _gddaq_parse_maps(f.read())
+        except OSError:
+            return []
+
+    def read(self, addr, n):
+        try:
+            return os.pread(self.fd, n, addr)
+        except OSError:
+            return b""
+
+    def regions(self, writable_only=True):
+        rs = []
+        for m in self.maps:
+            if writable_only and "w" not in m["perms"]:
+                continue
+            rs.append((m["lo"], m["hi"]))
+        return rs
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+def _gddaq_read_qstring(mem, addr, maxlen=1024):
+    """addr 处是 QString 对象 (8 字节指向 QStringData)。返回 str 或 None"""
+    raw = mem.read(addr, 8)
+    if len(raw) != 8:
+        return None
+    d = struct.unpack("<Q", raw)[0]
+    if not d:
+        return None
+    hdr = mem.read(d, 24)
+    if len(hdr) != 24:
+        return None
+    size = struct.unpack_from("<i", hdr, 4)[0]
+    offset = struct.unpack_from("<q", hdr, 16)[0]
+    if size < 0 or size > maxlen:
+        return None
+    if offset < 0 or offset > (1 << 24):
+        return None
+    data = mem.read(d + offset, size * 2)
+    if len(data) < size * 2:
+        return None
+    return data.decode("utf-16-le", errors="replace")
+
+
+def _gddaq_read_u64(mem, addr):
+    b = mem.read(addr, 8)
+    return struct.unpack("<Q", b)[0] if len(b) == 8 else None
+
+
+def _gddaq_read_u8(mem, addr):
+    b = mem.read(addr, 1)
+    return b[0] if len(b) == 1 else None
+
+
+def _gddaq_read_i32(mem, addr):
+    b = mem.read(addr, 4)
+    return struct.unpack("<i", b)[0] if len(b) == 4 else None
+
+
+def _gddaq_in_regions(addr, regions):
+    for lo, hi in regions:
+        if lo <= addr < hi:
+            return True
+    return False
+
+
+def _gddaq_scan_groups(mem, deep=False):
+    """可写区域分组并排序: 栈/小段 → heap → 匿名可写 (文件映射默认跳过)"""
+    rw = [m for m in mem.maps if "w" in m["perms"]]
+    stacks = [m for m in rw if m["path"] == "[stack]"]
+    heap = [m for m in rw if m["path"] == "[heap]"]
+    small = [m for m in rw if (m["hi"] - m["lo"]) < (4 << 20)
+             and m not in stacks and m not in heap]
+    rest = [m for m in rw if m not in stacks and m not in heap and m not in small]
+    anon = [m for m in rest if not m["path"]]
+    fileb = [m for m in rest if m["path"]]
+    g = [("[stack]+小段", stacks + small), ("[heap]", heap), ("匿名可写", anon)]
+    if deep:
+        g.append(("文件映射可写", fileb))
+    return [(lab, [(m["lo"], m["hi"]) for m in rs]) for lab, rs in g if rs]
+
+
+def _gddaq_find_by_vptr(mem, vptr, groups, budget=30.0):
+    """在给定区域里找对象头 (第 0 个字 == vptr), 一组命中即停"""
+    pat = struct.pack("<Q", vptr)
+    found = []
+    t0 = time.time()
+    over = False
+    hit_group = None
+    CH = 8 << 20
+    for label, regions in groups:
+        if time.time() - t0 > budget:
+            over = True
+            break
+        for lo, hi in regions:
+            a = lo
+            prev = b""
+            while a < hi:
+                n = min(CH, hi - a)
+                buf = mem.read(a, n)
+                if not buf:
+                    a += n
+                    prev = b""
+                    continue
+                i = 0
+                while True:
+                    j = buf.find(pat, i)
+                    if j < 0:
+                        break
+                    found.append(a + j)
+                    i = j + 1
+                if prev:                      # 跨块边界的匹配
+                    j = (prev + buf).find(pat)
+                    if j >= 0:
+                        found.append(a - len(prev) + j)
+                prev = buf[-16:]
+                a += len(buf)
+        if found:
+            hit_group = label
+            break
+    return sorted(set(found)), dict(seconds=time.time() - t0, budget_hit=over,
+                                    group=hit_group)
+
+
+def _gddaq_classify_candidate(mem, mw, off, regions):
+    """给一个候选 MainWindow 地址打分并抽出字段"""
+    res = dict(addr=mw, score=0)
+    folder = _gddaq_read_qstring(mem, mw + off["folder"])
+    prefix = _gddaq_read_qstring(mem, mw + off["prefix"])
+    run = _gddaq_read_qstring(mem, mw + off["run"])
+    lerun = _gddaq_read_u64(mem, mw + off["lerun"])
+    lefolder = _gddaq_read_u64(mem, mw + off["lefolder"])
+    rt = _gddaq_read_u64(mem, mw + off["readout"])
+
+    if folder and ("/" in folder):
+        res["score"] += 3
+        res["file_folder"] = folder
+    if prefix and 0 < len(prefix) <= 64 and re.fullmatch(r"[\w\-.]+", prefix):
+        res["score"] += 1
+        res["file_prefix"] = prefix
+    if run is not None and re.fullmatch(r"\d{0,6}", run):
+        res["score"] += 2
+        res["run_number"] = run
+    if lerun and _gddaq_in_regions(lerun, regions):
+        res["score"] += 1
+    if lefolder and _gddaq_in_regions(lefolder, regions):
+        res["score"] += 1
+    if rt and _gddaq_in_regions(rt, regions):
+        res["score"] += 1
+        res["mReadoutThread"] = rt
+    return res
+
+
+def _gddaq_heuristic_fields(mem, mw, regions, lo=0x100, hi=0x220):
+    """偏移漂移兜底: 在 MainWindow 内部一段范围找像 QString 的成员"""
+    out = {}
+    for o in range(lo, hi, 8):
+        s = _gddaq_read_qstring(mem, mw + o)
+        if not s:
+            continue
+        if "/" in s and s.startswith("/"):
+            out.setdefault("file_folder", (o, s))
+        elif re.fullmatch(r"\d{1,6}", s):
+            out.setdefault("run_number", (o, s))
+        elif re.fullmatch(r"[\w\-.]+", s):
+            out.setdefault("file_prefix", (o, s))
+    return out
+
+
+def _gddaq_find_gui_pid():
+    """按进程名 (comm/cmdline) 找 gddaq 进程"""
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        entries = []
+    for e in entries:
+        if not e.isdigit():
+            continue
+        try:
+            with open("/proc/%s/comm" % e) as f:
+                comm = f.read().strip()
+        except OSError:
+            continue
+        if not comm.startswith("gddaq"):
+            continue
+        try:
+            with open("/proc/%s/cmdline" % e, "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            cmd = ""
+        if "gddaq" in cmd:
+            return int(e)
+    return None
+
+
+def _gddaq_exe_base(mem, pid, notes=None):
+    """PIE 载入基址 = exe 第一个 offset=0 映射的起始地址 (多级兜底)"""
+    if notes is None:
+        notes = []
+    exe = ""
+    try:
+        exe = os.readlink("/proc/%d/exe" % pid)
+        if exe.endswith(" (deleted)"):
+            exe = exe[: -len(" (deleted)")]
+    except OSError as e:
+        notes.append("读 /proc/%d/exe 失败: %s" % (pid, e))
+
+    base = None
+    cands = [m for m in mem.maps if exe and m["path"] == exe and m["off"] == 0]
+    if cands:
+        base = min(c["lo"] for c in cands)
+    else:
+        want = os.path.basename(exe) if exe else "gddaq"
+        cands = [m for m in mem.maps if os.path.basename(m["path"]) == want and m["off"] == 0]
+        if cands:
+            base = min(c["lo"] for c in cands)
+    if base is None:
+        # 不依赖路径的强校验: exe 文件头与映射内容比对
+        try:
+            with open("/proc/%d/exe" % pid, "rb") as f:
+                head = f.read(16)
+            for m in sorted(mem.maps, key=lambda x: x["lo"]):
+                if m["off"] != 0 or "r" not in m["perms"]:
+                    continue
+                if head and mem.read(m["lo"], len(head)) == head:
+                    base = m["lo"]
+                    break
+        except OSError:
+            pass
+    if base is None:
+        for m in sorted(mem.maps, key=lambda x: x["lo"]):
+            if "r" not in m["perms"] or m["off"] != 0:
+                continue
+            if mem.read(m["lo"], 4) == b"\x7fELF":
+                base = m["lo"]
+                break
+    if base is None:
+        raise RuntimeError("无法定位 gddaq 的载入基址")
+    return base, exe
+
+
+def _gddaq_resolve(pid, off, vptr_mw, vptr_rt, mem=None, scan_budget=30.0):
+    """定位 MainWindow 实例, 返回 (best, ctx)"""
+    close = False
+    if mem is None:
+        mem = ProcMem(pid)
+        close = True
+    try:
+        notes = []
+        base, exe = _gddaq_exe_base(mem, pid, notes)
+
+        # 优先从目标进程自己的 ELF 里取 vtable 符号地址 (二进制升级自适应)
+        try:
+            elf = ElfFile("/proc/%d/exe" % pid)
+            syms = elf.symtab()
+            for key in ("mainwindow", "readoutthread"):
+                v = syms.get(GDDAQ_TARGET_SYMS[key])
+                if v:
+                    # vptr 指向 vtable 第 3 格 (前两格是 offset-to-top 与 typeinfo)
+                    if key == "mainwindow":
+                        vptr_mw = v + 16
+                    else:
+                        vptr_rt = v + 16
+                else:
+                    notes.append("%s 不在符号表里，用默认值" % GDDAQ_TARGET_SYMS[key])
+        except Exception as e:
+            notes.append("读 exe 符号失败(%s)，用默认值" % type(e).__name__)
+
+        groups = _gddaq_scan_groups(mem)
+        cands, stats = _gddaq_find_by_vptr(mem, base + vptr_mw, groups,
+                                           budget=scan_budget)
+        regions = [r for _lab, rs in groups for r in rs]
+        if not cands:
+            return None, dict(base=base, exe=exe, vptr_mw=vptr_mw, vptr_rt=vptr_rt,
+                              regions=regions, notes=notes, scan=stats)
+        scored = [_gddaq_classify_candidate(mem, c, off, regions) for c in cands]
+        scored.sort(key=lambda x: -x["score"])
+        ctx = dict(base=base, exe=exe, vptr_mw=vptr_mw, vptr_rt=vptr_rt,
+                   regions=regions, notes=notes, scan=stats)
+        return scored[0], ctx
+    finally:
+        if close:
+            mem.close()
+
+
+def _gddaq_mem_snapshot(pid, off, vptr_mw, vptr_rt, state):
+    """读一次 gddaq 状态, 返回 dict (供守护循环写入状态文件)"""
+    st = dict(pid=pid, running=None, run_number=None, file_folder=None,
+              file_prefix=None, ts=time.time())
+
+    mem = state.get("mem")
+    if mem is None or state.get("pid") != pid:
+        if mem:
+            mem.close()
+        mem = ProcMem(pid)          # 需要 root
+        state["mem"] = mem
+        state["pid"] = pid
+        state["mw"] = None
+
+    mw = state.get("mw")
+    if mw is None:
+        best, ctx = _gddaq_resolve(pid, off, vptr_mw, vptr_rt, mem=mem)
+        state["ctx"] = ctx
+        if best is None:
+            st["note"] = "没定位到 MainWindow 实例 (gddaq 版本可能已变化)"
+            return st
+        mw = best["addr"]
+        state["mw"] = mw
+        state["rt"] = best.get("mReadoutThread")
+
+    f = _gddaq_read_qstring(mem, mw + off["folder"])
+    p = _gddaq_read_qstring(mem, mw + off["prefix"])
+    r = _gddaq_read_qstring(mem, mw + off["run"])
+    if not (f and "/" in f):
+        # 固定偏移读不到 → 就近启发式兜底 (偏移漂移)
+        g = _gddaq_heuristic_fields(mem, mw, state.get("ctx", {}).get(
+            "regions", mem.regions()))
+        if "file_folder" in g:
+            f = g["file_folder"][1]
+        if "run_number" in g:
+            r = g["run_number"][1]
+        if "file_prefix" in g and not p:
+            p = g["file_prefix"][1]
+    st["file_folder"] = f
+    st["file_prefix"] = p
+    st["run_number"] = int(r) if (r and r.isdigit()) else None
+
+    rt = state.get("rt") or _gddaq_read_u64(mem, mw + off["readout"])
+    ctx = state.get("ctx", {})
+    regs = ctx.get("regions") or mem.regions()
+    base = ctx.get("base")
+    vptr_rt_real = (base + ctx["vptr_rt"]) if (base and ctx.get("vptr_rt")) else None
+
+    # ReadoutThread 自校验: 指针在映射内 且 vptr 匹配
+    if not (rt and _gddaq_in_regions(rt, regs) and vptr_rt_real
+            and _gddaq_read_u64(mem, rt) == vptr_rt_real):
+        hit = None
+        if vptr_rt_real:
+            groups = _gddaq_scan_groups(mem)
+            found, _st = _gddaq_find_by_vptr(mem, vptr_rt_real, groups, budget=10.0)
+            if found:
+                hit = found[0]
+        if hit:
+            st["note"] = "mReadoutThread 偏移已失效, 已按 vtable 重新定位"
+            rt = hit
+        else:
+            rt = None
+            st["note"] = "找不到合法的 ReadoutThread 实例 (偏移可能已失效)"
+    state["rt"] = rt
+
+    if rt:
+        running = _gddaq_read_u8(mem, rt + off["m_running"])
+        back = _gddaq_read_u64(mem, rt + 0x10)   # mMainWindow 应回指 MainWindow
+        if (running in (0, 1)) and (back == mw):
+            st["running"] = (running == 1)
+            st["rt_verified"] = True
+        else:
+            st["rt_verified"] = False
+            st["note"] = (st.get("note") or "") + "; ReadoutThread 自校验失败"
+        st["rt_runno"] = _gddaq_read_i32(mem, rt + off["rt_runno"])
+    return st
+
+
+def _gddaq_pid_alive(pid):
+    """进程是否仍存活 (信号 0 探测; EPERM 也算存活)"""
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _gddaq_hprint(msg):
+    """helper 模式安全打印 (windowed 打包下 stdout 可能为 None)"""
+    try:
+        if sys.stdout is not None:
+            print(msg, flush=True)
+    except Exception:
+        pass
+
+
+def gddaq_mem_helper_main(argv):
+    """GDDAQ 内存读取守护进程入口 (root 下由本程序自身调用)
+
+    用法: <本程序> --gddaq-mem-helper -o <状态文件> --stop-file <停止标志>
+    循环: 每轮读一次 gddaq 内存状态 → 原子写 JSON (chmod 0644);
+    gddaq 缺席/重启时自动跟随; 停止标志被删除即干净退出。
+    """
+    import argparse
+    ap = argparse.ArgumentParser(prog="gddaq-mem-helper", add_help=True)
+    ap.add_argument("-i", "--interval", type=float, default=1.0)
+    ap.add_argument("-o", "--out", required=True,
+                    help="状态 JSON 输出路径 (原子替换)")
+    ap.add_argument("--stop-file", required=True,
+                    help="停止标志: 该文件被删除即退出")
+    ap.add_argument("--pid", type=int, default=None)
+    ap.add_argument("--scan-budget", type=float, default=30.0)
+    ap.add_argument("--vptr-mw", type=lambda x: int(x, 0), default=GDDAQ_DEF_VT["mainwindow"])
+    ap.add_argument("--vptr-rt", type=lambda x: int(x, 0), default=GDDAQ_DEF_VT["readoutthread"])
+    for k, v in GDDAQ_DEF_OFF.items():
+        ap.add_argument("--off-" + k.replace("_", "-"), type=lambda x: int(x, 0), default=v)
+    args = ap.parse_args(argv)
+
+    off = dict(GDDAQ_DEF_OFF)
+    for k in list(GDDAQ_DEF_OFF):
+        off[k] = getattr(args, "off_" + k)
+
+    out_path = os.path.abspath(args.out)
+    stop_path = os.path.abspath(args.stop_file)
+    pid = args.pid or _gddaq_find_gui_pid()
+
+    def write_status(st):
+        # 每轮发布心跳; 时间戳标识本次发布, 不依赖状态是否变化。
+        # Publish every poll, including idle/error states; logs alone are deduplicated.
+        st["ts"] = time.time()
+        tmp = out_path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(json.dumps(st, ensure_ascii=False) + "\n")
+        os.replace(tmp, out_path)
+        # root 写出的文件须放宽读权限, 普通用户的 GUI 才能读
+        try:
+            os.chmod(out_path, 0o644)
+        except OSError:
+            pass
+
+    def null_status(note="gddaq process not found", status="process_missing", pid=None):
+        return dict(pid=pid, status=status, running=None, run_number=None,
+                    file_folder=None, file_prefix=None, ts=time.time(), note=note)
+
+    state = {}
+    lastkey = None
+    last_err = None
+    _gddaq_hprint("gddaq-mem-helper started (pid=%d)" % os.getpid())
+    while True:
+        # 停止标志被删除 → 干净退出
+        if not os.path.exists(stop_path):
+            if state.get("mem") is not None:
+                state["mem"].close()
+            _gddaq_hprint("stop-file 已删除，退出守护循环")
+            break
+
+        # gddaq 缺席/死亡时自动 (重) 找 pid
+        if pid is None or not _gddaq_pid_alive(pid):
+            newpid = _gddaq_find_gui_pid()
+            if newpid is None:
+                if pid is not None:
+                    _gddaq_hprint("gddaq (pid=%d) 已退出，等待其重新启动..." % pid)
+                    lastkey = None
+                pid = None
+                if state.get("mem") is not None:
+                    try:
+                        state["mem"].close()
+                    except Exception:
+                        pass
+                state = {}
+                nkey = (None, None, None)
+                write_status(null_status())
+                lastkey = nkey
+                time.sleep(max(0.05, args.interval))
+                continue
+            if newpid != pid:
+                _gddaq_hprint("gddaq pid = %d（重新定位）" % newpid)
+                pid = newpid
+                lastkey = None
+                last_err = None
+                if state.get("mem") is not None:
+                    try:
+                        state["mem"].close()
+                    except Exception:
+                        pass
+                state = {}
+
+        try:
+            st = _gddaq_mem_snapshot(pid, off, args.vptr_mw, args.vptr_rt, state)
+        except Exception as e:
+            msg = "%s: %s" % (type(e).__name__, e)
+            if msg != last_err:   # 同一错误去重, 避免每轮刷屏
+                _gddaq_hprint("[warn] %s" % msg)
+                last_err = msg
+            if state.get("mem") is not None:
+                state["mem"].close()
+            state = {}
+            # 只清扫描缓存, pid 保留: 进程死亡由循环顶部的存活检查统一处理
+            nkey = (None, None, None)
+            write_status(null_status("snapshot failed: %s" % e,
+                                     status="read_error", pid=pid))
+            lastkey = nkey
+            time.sleep(max(0.2, args.interval))
+            continue
+        last_err = None
+        st["status"] = "ok" if type(st.get("running")) is bool else "read_error"
+        active_run = st.get("rt_runno") if st.get("running") else st.get("run_number")
+        key = (st["status"], st.get("running"), active_run, st.get("file_folder"))
+        if key != lastkey:
+            _gddaq_hprint("state: running=%s run=%s folder=%s"
+                          % (st.get("running"), active_run,
+                             st.get("file_folder")))
+            lastkey = key
+        write_status(st)
+        time.sleep(max(0.05, args.interval))
+
+
+# ---- root helper 模式入口: 必须位于所有 GUI/科学库 import 之前 ----
+# (Entry point for the root helper copy; must stay BEFORE all GUI imports)
+if "--gddaq-mem-helper" in sys.argv[1:]:
+    _rest = [a for a in sys.argv[1:] if a != "--gddaq-mem-helper"]
+    gddaq_mem_helper_main(_rest)
+    sys.exit(0)
+# ===================== GDDAQ 内存读取核心结束 =====================
+
 import math
 import getpass
 import tempfile
@@ -30,6 +701,7 @@ import shutil
 import re
 import socket
 import subprocess
+import json
 from datetime import datetime
 from decimal import Decimal, getcontext
 from PyQt5 import QtWidgets, QtCore, QtGui
@@ -60,7 +732,7 @@ rcParams['grid.alpha'] = 0.7
 
 # 应用版本号 (与 about.html 中显示的版本保持一致)
 # Application version (kept in sync with the version shown in about.html)
-VERSION = "v1.0.1"
+VERSION = "v1.1.0"
 
 # 单位到 mA 的转换系数 (模块级常量, 供主窗口与设置对话框共用)
 # (Unit-to-mA conversion factors, shared by the main window and settings dialogs)
@@ -725,14 +1397,32 @@ class MonitorSettingsDialog(QDialog):       #类: 设置对话框
         super().accept()
 
 class GDDAQSettingsDialog(QDialog):      # 类: GDDAQ 设置对话框
-    def __init__(self, search_dir, proc_name, target_run, parent=None):
+    def __init__(self, search_dir, proc_name, method="log", parent=None):
         super().__init__(parent)
         self.setWindowTitle("GDDAQ Settings")
-        self.resize(450, 180)
-        self.init_ui(search_dir, proc_name, target_run)
+        self.resize(450, 220)
+        self.init_ui(search_dir, proc_name, method)
 
-    def init_ui(self, search_dir, proc_name, target_run):
+    def init_ui(self, search_dir, proc_name, method):
         layout = QtWidgets.QFormLayout()
+
+        # 0. 检测方式: run.log 解析 (默认) / 进程内存读取 (需 root)
+        # (Detection method: run.log parsing (default) / process memory read (root))
+        self.method_combo = QComboBox()
+        self.method_combo.addItem("run.log (default)", userData="log")
+        self.method_combo.addItem("Process Memory (root)", userData="memory")
+        idx = self.method_combo.findData(method if method in ("log", "memory") else "log")
+        self.method_combo.setCurrentIndex(max(0, idx))
+        self.method_combo.setToolTip(
+            "run.log: parse the DAQ run.log file (no extra privileges).\n"
+            "Process Memory: read DAQ state directly from the gddaq process memory "
+            "via a root helper (a sudo password prompt appears when the link starts). "
+            "In this mode Data Directory is an optional folder fallback; "
+            "Process Name is only used by run.log mode.")
+        # 内存法运行时依赖 root helper, 切换时机受联动状态约束 (见 open_gddaq_settings)
+        # (Memory mode relies on a root helper; switching is guarded while linked)
+        self.method_combo.currentIndexChanged.connect(self._on_method_changed)
+        layout.addRow("Detection Method:", self.method_combo)
 
         # 1. 数据根目录 (带 Browse 按钮)
         self.search_dir_input = QLineEdit(search_dir)
@@ -763,15 +1453,10 @@ class GDDAQSettingsDialog(QDialog):      # 类: GDDAQ 设置对话框
         self.proc_name_input.setToolTip("DAQ process name for pgrep -x detection (e.g. gddaq)")
         layout.addRow("Process Name:", self.proc_name_input)
 
-        # 3. 监控轮次 (可留空 = 自动监控最大编号的轮次)
-        self.target_run_input = QLineEdit(target_run)
-        self.target_run_input.setPlaceholderText("Leave empty = auto (highest run number)")
-        self.target_run_input.setToolTip("Leave empty to auto-monitor the run with the highest number; fill a number to monitor a specific run")
-        layout.addRow("Run Number:", self.target_run_input)
-
         # 说明标签
-        note = QLabel("Note: Run number corresponds to numbered subdirectories under the data directory.\n"
-                      "Leave empty to auto-monitor the run with the highest number.")
+        note = QLabel("Runs are selected automatically.\n"
+                      "run.log: highest numbered folder; Process Memory: active DAQ run.\n"
+                      "CSV files are saved in CurrentData beside the data directory.")
         note.setStyleSheet("color: gray; font-size: 10px;")
         note.setWordWrap(True)
         layout.addRow(note)
@@ -799,23 +1484,28 @@ class GDDAQSettingsDialog(QDialog):      # 类: GDDAQ 设置对话框
         # Required-field validation: disable Apply when Data Directory / Process Name is empty
         self.search_dir_input.textChanged.connect(self.validate_inputs)
         self.proc_name_input.textChanged.connect(self.validate_inputs)
-        self.target_run_input.textChanged.connect(self.validate_inputs)
+        self.validate_inputs()
+
+    def _on_method_changed(self):
+        """检测方式切换后必填项约束变化, 重新校验
+        (Required-field rules depend on the method; re-validate on switch)"""
         self.validate_inputs()
 
     def validate_inputs(self):
         """校验必填项与目录有效性，控制 Apply 按钮可用状态
-        (Validate required fields and directory existence, toggle Apply button)"""
+        (Validate required fields and directory existence, toggle Apply button)
+
+        内存法下目录可选 (仅作 file_folder 的回退), 进程名仅供 log 法使用。
+        (Memory mode has an optional folder fallback; process name is log-only.)"""
         search_dir = self.search_dir_input.text().strip()
         proc_name = self.proc_name_input.text().strip()
-        target_run = self.target_run_input.text().strip()
+        method = self.method_combo.currentData() if hasattr(self, "method_combo") else "log"
+        self.proc_name_input.setEnabled(method == "log")
 
-        if not search_dir or not proc_name:
+        if method == "log" and (not search_dir or not proc_name):
             reason = "Data Directory and Process Name are required."
-        elif not os.path.isdir(search_dir):
+        elif search_dir and not os.path.isdir(search_dir):
             reason = "Data Directory does not exist."
-        elif target_run and not target_run.isdigit():
-            # 运行号必须是非负整数或留空 (Run number: non-negative integer or empty)
-            reason = "Run Number must be a non-negative integer (or leave empty)."
         else:
             reason = ""
 
@@ -826,8 +1516,8 @@ class GDDAQSettingsDialog(QDialog):      # 类: GDDAQ 设置对话框
     def on_apply(self):
         """Apply 前最终校验，防止目录在输入后被外部删除
         (Final validation before applying, in case the directory was removed)"""
+        self.validate_inputs()
         if not self.ok_btn.isEnabled():
-            self.validate_inputs()
             return
         self.accept()
 
@@ -840,11 +1530,11 @@ class GDDAQSettingsDialog(QDialog):      # 类: GDDAQ 设置对话框
             self.search_dir_input.setText(chosen)
 
     def get_values(self):
-        """获取设置值"""
+        """获取设置值 (search_dir, proc_name, method)"""
         return (
             self.search_dir_input.text().strip(),
             self.proc_name_input.text().strip() or "gddaq",
-            self.target_run_input.text().strip()
+            self.method_combo.currentData() or "log"
         )
 
 class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
@@ -960,7 +1650,9 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         # GDDAQ 监控初始化
         self.gddaq_search_dir = ""          # 数据根目录 (如 /home/rnb/Data/202605ams/raw/)
         self.gddaq_proc_name = "gddaq"      # DAQ 进程名 (用于 pgrep -x)
-        self.gddaq_target_run = ""          # 目标轮次 (空=自动监控最新轮次)
+        self.gddaq_recording_run = None    # (normalized raw directory, run number)
+        self._gddaq_start_dir = None        # 本次启动实际使用的目录 (effective start folder)
+        self._start_error_key = None        # 自动启动错误去重 (automatic start errors)
         self.gddaq_timer = QTimer()
         self.gddaq_timer.timeout.connect(self.check_gddaq_status)
         self.gddaq_timer.setInterval(1000)  # 每1秒检查一次
@@ -991,6 +1683,18 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
 
         # DAQ 模式互斥标记: None / "daq_master" / "gddaq"
         self.active_daq_mode = None
+
+        # GDDAQ 检测方式: "log" (run.log 解析, 默认) / "memory" (gddaq 进程内存读取)
+        # (GDDAQ detection method: "log" parses run.log (default); "memory" reads
+        #  the gddaq process memory via a root helper started on link activation)
+        self.gddaq_detect_method = "log"
+        # 内存法 root helper (--gddaq-mem-helper, sudo 常驻子进程) 相关状态
+        # (State for the memory-mode root helper subprocess)
+        self.gddaq_mem_proc = None           # sudo 子进程句柄 (None = 未运行)
+        self.gddaq_mem_status_path = None    # helper 原子写的 JSON 状态文件路径
+        self.gddaq_mem_stop_path = None      # 停止标志文件路径 (删除即请求 helper 退出)
+        self.gddaq_mem_last_note = None      # helper note 诊断信息去重
+        self._reset_gddaq_mem_tracking()
 
         # 状态监控初始化
         self.monitor1 = StatusMonitor()
@@ -1145,7 +1849,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         self.gddaq_connect_action.setCheckable(True)
         self.gddaq_connect_action.setChecked(False)
         self.gddaq_connect_action.triggered.connect(self.toggle_gddaq_connection)
-        self.gddaq_connect_action.setToolTip("Sync Start/Stop with GDDAQ System via run.log monitoring")
+        self.gddaq_connect_action.setToolTip("Sync Start/Stop with GDDAQ System (detection method configurable in GDDAQ Settings)")
         daq_submenu.addAction(self.gddaq_connect_action)
 
         # 注意：不使用 QActionGroup 的互斥功能 (exclusive 默认 True 会阻止取消勾选)。
@@ -1401,15 +2105,206 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         dialog = GDDAQSettingsDialog(
             self.gddaq_search_dir,
             self.gddaq_proc_name,
-            self.gddaq_target_run,
+            self.gddaq_detect_method,
             self
         )
         if dialog.exec_() == QDialog.Accepted:
-            self.gddaq_search_dir, self.gddaq_proc_name, self.gddaq_target_run = dialog.get_values()
-            print(f"GDDAQ Settings Updated: dir={self.gddaq_search_dir}, proc={self.gddaq_proc_name}, run={self.gddaq_target_run or '(auto)'}")
+            search_dir, proc_name, method = dialog.get_values()
+
+            # 检测方式不可在联动开启期间切换 (log/memory 的轮询循环与
+            # helper 生命周期不同, 中途切换会造成状态混乱)
+            # (The detection method cannot be switched while the link is
+            #  active: the two modes have different poll loops & helper lifetime)
+            if method != self.gddaq_detect_method and self.active_daq_mode == "gddaq":
+                QMessageBox.warning(self, "Warning",
+                    "Detection method cannot be changed while the GDDAQ link is active.\n"
+                    "Disconnect the GDDAQ link first (the running method was kept).")
+                method = self.gddaq_detect_method
+
+            self.gddaq_search_dir = search_dir
+            self.gddaq_proc_name = proc_name
+            self.gddaq_detect_method = method
+            print(f"GDDAQ Settings Updated: dir={self.gddaq_search_dir or '(none)'}, "
+                  f"proc={self.gddaq_proc_name}, "
+                  f"method={self.gddaq_detect_method}")
             self.log_bus.log("INFO",
                 f"GDDAQ settings applied: dir={self.gddaq_search_dir}, "
-                f"proc={self.gddaq_proc_name}, run={self.gddaq_target_run or '(auto)'}")
+                f"proc={self.gddaq_proc_name}, "
+                f"method={self.gddaq_detect_method}")
+
+    def _gddaq_mem_paths(self):
+        """确定内存法状态/停止文件路径 (用户私有目录, 避免 /tmp 世界可写路径被劫持)
+
+        状态文件由 root helper 原子写 (tmp+rename 后 chmod 0644)；停止标志由
+        本程序创建, 删除即请求 helper 退出。目录用 XDG_RUNTIME_DIR (700, 用户
+        私有), 回退 tempfile 目录下带 pid 后缀的子目录。
+        (Private per-user dir for the memory-mode status/stop files; the helper
+        writes the JSON status file, we own the stop flag: deleting it asks the
+        helper to exit.)
+        """
+        base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+        run_dir = os.path.join(base, "current_monitor_gddaq_%d" % os.getpid())
+        os.makedirs(run_dir, exist_ok=True)
+        try:
+            os.chmod(run_dir, 0o700)
+        except OSError:
+            pass
+        status_path = os.path.join(run_dir, "mem_status.json")
+        stop_path = os.path.join(run_dir, "mem.stop")
+        # 清理上次残留的状态文件 (helper 每轮都会重写, 这里只保证起点干净)
+        try:
+            os.remove(status_path)
+        except OSError:
+            pass
+        # 创建停止标志: 存在 = 允许运行, 删除 = 请求退出
+        with open(stop_path, "w"):
+            pass
+        return status_path, stop_path
+
+    def _start_gddaq_mem_helper(self):
+        """索取 root 密码并以 sudo 启动内存读取守护子进程 (Start the root helper)
+
+        helper 就是本程序自身的一个 root 副本: `sudo <本程序> --gddaq-mem-helper
+        ...`。该副本在导入任何 GUI/科学库之前即进入纯标准库守护循环 (见文件
+        顶部 GDDAQ 内存读取核心), 因此打包后无需目标机器安装 python3, 也无需
+        附带外部脚本。
+        - 密码仅经 stdin 传给 sudo -S, 不写日志/不保存
+        - sudo 认证失败 (子进程快速退出 rc!=0) 时允许重试, 最多 3 次
+        - 返回 True 表示 helper 已在运行; False = 用户取消/启动失败
+        (The helper is a root copy of this program itself: it runs the
+        stdlib-only daemon loop before any GUI import. Password goes to
+        sudo's stdin only; up to 3 attempts on auth failure.)
+        """
+        sudo_bin = shutil.which("sudo")
+        if not sudo_bin:
+            QMessageBox.critical(self, "Error",
+                "sudo is required for GDDAQ memory-read mode but was not found\n"
+                "in PATH.")
+            return False
+
+        # helper 载体: 打包后 sys.executable 即本可执行文件; 开发模式下是
+        # python 解释器, 需附带本脚本路径
+        # (Frozen: sys.executable is this program; dev: interpreter + script)
+        if getattr(sys, "frozen", False):
+            helper_cmd = [sys.executable, "--gddaq-mem-helper"]
+        else:
+            helper_cmd = [sys.executable, os.path.abspath(__file__),
+                          "--gddaq-mem-helper"]
+
+        status_path, stop_path = self._gddaq_mem_paths()
+
+        for attempt in range(3):
+            password, ok = QInputDialog.getText(
+                self, "Root Privileges Required",
+                "GDDAQ memory-read mode reads the gddaq process memory,\n"
+                "which requires root privileges.\n\n"
+                "Enter the sudo password to start the privileged helper:",
+                QLineEdit.Password)
+            if not ok or not password:
+                return False   # 用户取消 (user cancelled)
+
+            cmd = [sudo_bin, "-S", "-p", ""] + helper_cmd + [
+                "-i", "1",
+                "-o", status_path,
+                "--stop-file", stop_path]
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError as e:
+                QMessageBox.critical(self, "Error",
+                    f"Failed to start the memory-read helper:\n{e}")
+                return False
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.write((password + "\n").encode())
+                    proc.stdin.flush()
+                    proc.stdin.close()
+            except OSError:
+                pass   # 子进程可能已退出, 下方用返回码判断 (rc decides)
+            password = None   # 尽快释放密码引用 (drop the password reference)
+
+            # sudo 密码错误/权限失败时子进程会立刻退出 (rc != 0)
+            for _ in range(15):
+                QApplication.processEvents()
+                time.sleep(0.1)
+                if proc.poll() is not None:
+                    break
+            if proc.poll() is not None:
+                QMessageBox.warning(self, "Authentication Failed",
+                    "sudo authentication failed (wrong password?).\n"
+                    f"Attempt {attempt + 1} of 3.")
+                continue
+
+            # 等状态文件出现: helper 首轮定位 MainWindow 约 0.1~2s (栈区优先);
+            # gddaq 不在时也会立刻写出 running=null 的占位状态。打包 (onefile)
+            # 模式下 root 副本启动还需先完成自解压 (约 2~5s), 故放宽到 8s。
+            # (Wait for the status file: ~0.1-2s for the first MainWindow scan;
+            #  packaged onefile builds add a 2-5s self-extraction under sudo.)
+            waited = 0.0
+            while waited < 8.0 and not os.path.exists(status_path):
+                QApplication.processEvents()
+                time.sleep(0.1)
+                waited += 0.1
+                if proc.poll() is not None:
+                    break
+            if proc.poll() is not None:
+                QMessageBox.warning(self, "Helper Failed",
+                    "The memory-read helper exited unexpectedly during startup.\n"
+                    "See the application log for details.")
+                continue
+
+            self.gddaq_mem_proc = proc
+            self.gddaq_mem_status_path = status_path
+            self.gddaq_mem_stop_path = stop_path
+            self._reset_gddaq_mem_tracking()
+            print(f"GDDAQ memory helper started (pid={proc.pid})")
+            self.log_bus.log("INFO", "GDDAQ memory-read helper started (sudo)")
+            return True
+
+        return False
+
+    def _stop_gddaq_mem_helper(self):
+        """停止内存法 root helper: 删停止标志 → 宽限等待 → terminate/kill 兜底
+
+        停止标志是主要机制 (helper 每轮轮询都会检查, ≤1s 内自行退出);
+        信号兜底仅在 helper 卡死时使用 (sudo 前台模式会向子进程转发信号)。
+        (Stop-file removal is the primary mechanism; signals are the fallback.)
+        """
+        proc = self.gddaq_mem_proc
+        if proc is None:
+            return
+        # 1) 删除停止标志文件
+        try:
+            if self.gddaq_mem_stop_path:
+                os.remove(self.gddaq_mem_stop_path)
+        except OSError:
+            pass
+        # 2) 宽限等待 ~2s (processEvents 维持 UI 响应)
+        for _ in range(20):
+            if proc.poll() is not None:
+                break
+            QApplication.processEvents()
+            time.sleep(0.1)
+        # 3) 兜底信号: terminate (SIGTERM, sudo 转发) → kill
+        if proc.poll() is None:
+            for sig in ("terminate", "kill"):
+                try:
+                    getattr(proc, sig)()
+                    proc.wait(timeout=2)
+                    break
+                except (OSError, subprocess.TimeoutExpired):
+                    continue
+        # 4) 清理状态文件
+        if self.gddaq_mem_status_path:
+            try:
+                os.remove(self.gddaq_mem_status_path)
+            except OSError:
+                pass
+        print("GDDAQ memory helper stopped")
+        self.log_bus.log("INFO", "GDDAQ memory-read helper stopped")
+        self.gddaq_mem_proc = None
+        self._reset_gddaq_mem_tracking()
 
     def toggle_gddaq_connection(self):
         """切换 GDDAQ 连接模式 (与 DAQ_Master 互斥)"""
@@ -1429,20 +2324,37 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                 self.daq_connect_action.setChecked(False)
                 self.toggle_daq_connection()
 
-            # 检查必填配置: 数据目录和进程名均不能为空
-            # Required config check: both data directory and process name must be set
-            if not self.gddaq_search_dir or not self.gddaq_proc_name:
-                QMessageBox.warning(self, "Warning",
-                    "GDDAQ Data Directory and Process Name must be set!\n"
-                    "Please configure them via 'Connect to DAQ' -> 'GDDAQ Settings...' first.")
-                self.gddaq_connect_action.setChecked(False)
-                return
+            # 检测方式分流: 内存法先启动 root helper (弹密码框), log 法走原必填校验
+            # (Dispatch by method: memory mode starts the root helper first with a
+            #  password prompt; log mode keeps the original required-field checks)
+            if self.gddaq_detect_method == "memory":
+                # 内存法下 search_dir 可选 (file_folder 从内存读取), 仅在填写时校验
+                # (search_dir is optional in memory mode; validate only if filled)
+                if self.gddaq_search_dir and not os.path.isdir(self.gddaq_search_dir):
+                    QMessageBox.warning(self, "Warning",
+                        f"GDDAQ data directory does not exist:\n{self.gddaq_search_dir}")
+                    self.gddaq_connect_action.setChecked(False)
+                    return
+                # 索取 root 密码并启动 helper; 失败/取消则回退勾选
+                # (Ask for the root password and start the helper; revert on failure)
+                if not self._start_gddaq_mem_helper():
+                    self.gddaq_connect_action.setChecked(False)
+                    return
+            else:
+                # 检查必填配置: 数据目录和进程名均不能为空
+                # Required config check: both data directory and process name must be set
+                if not self.gddaq_search_dir or not self.gddaq_proc_name:
+                    QMessageBox.warning(self, "Warning",
+                        "GDDAQ Data Directory and Process Name must be set!\n"
+                        "Please configure them via 'Connect to DAQ' -> 'GDDAQ Settings...' first.")
+                    self.gddaq_connect_action.setChecked(False)
+                    return
 
-            if not os.path.isdir(self.gddaq_search_dir):
-                QMessageBox.warning(self, "Warning",
-                    f"GDDAQ data directory does not exist:\n{self.gddaq_search_dir}")
-                self.gddaq_connect_action.setChecked(False)
-                return
+                if not os.path.isdir(self.gddaq_search_dir):
+                    QMessageBox.warning(self, "Warning",
+                        f"GDDAQ data directory does not exist:\n{self.gddaq_search_dir}")
+                    self.gddaq_connect_action.setChecked(False)
+                    return
 
             self.active_daq_mode = "gddaq"
             self.daq_connect_action.setEnabled(False)  # 联动期间禁用对方入口
@@ -1454,6 +2366,8 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
 
             # 重置状态
             self.gddaq_last_state = "IDLE"
+            self.gddaq_recording_run = None
+            self._start_error_key = None
             self.gddaq_last_log_mtime = 0
             self.gddaq_last_alive_time = None
             self.gddaq_dir_invalid_logged = False  # 重置目录失效去重标志
@@ -1463,17 +2377,27 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.gddaq_follow_stop_count = 0       # 重置重启取数跟踪状态 (reset restart tracking)
             self.gddaq_fin_stop_count = 0
             self.gddaq_finished_since = None
+            # 内存法状态基准 (_start_gddaq_mem_helper 已重置, 这里兜底确保干净)
+            # (Memory-mode baselines; also reset by _start_gddaq_mem_helper)
+            self._reset_gddaq_mem_tracking()
 
             self.gddaq_timer.start()
             print("GDDAQ Connection Enabled: Monitoring started.")
             self.log_bus.log("INFO", "GDDAQ auto-link enabled")
-            self.save_status_label.setText("GDDAQ Mode: Waiting for run.log signal...")
+            if self.gddaq_detect_method == "memory":
+                self.save_status_label.setText("GDDAQ Mode: Waiting for memory-read signal...")
+            else:
+                self.save_status_label.setText("GDDAQ Mode: Waiting for run.log signal...")
             self.save_status_label.setStyleSheet("color: blue;")
         else:
             # 关闭模式
             self.gddaq_timer.stop()
             self.active_daq_mode = None
             self.gddaq_proc_alive_last = None     # 清除进程存活边沿检测基准 (clear liveness baseline)
+            # 内存法: 先停 root helper (删停止标志 + 信号兜底), 再走共用恢复逻辑
+            # (Memory mode: stop the root helper first, then the common restore path)
+            if self.gddaq_detect_method == "memory":
+                self._stop_gddaq_mem_helper()
             self.daq_connect_action.setEnabled(True)   # 恢复对方入口
 
             # 如果当前运行由 GDDAQ 触发, 联动停止; 手动启动的运行不受影响
@@ -1557,43 +2481,82 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             return False
 
     def get_gddaq_run_dir(self):
-        """
-        返回目标轮次的数据目录路径。
-        - target_run 为空: 返回 search_dir 下最大编号的数字子目录
-        - target_run 非空: 返回 search_dir/<target_run> 目录
-        返回 (run_dir, run_id_str) 或 (None, error_msg)
-        参考 run_timer.py 的 get_run_data() 逻辑。
-        """
+        """自动选择最大编号的 run 文件夹 (always follow the highest numbered folder)."""
         try:
-            # 获取所有数字命名的子目录
-            dirs = [
-                d for d in os.listdir(self.gddaq_search_dir)
-                if os.path.isdir(os.path.join(self.gddaq_search_dir, d)) and d.isdigit()
-            ]
-
+            root = os.path.realpath(self.gddaq_search_dir)
+            dirs = [d for d in os.listdir(root)
+                    if re.fullmatch(r"[0-9]+", d)
+                    and os.path.isdir(os.path.join(root, d))]
             if not dirs:
                 return None, "No numbered run folders found"
-
-            if self.gddaq_target_run:
-                # 指定轮次
-                target = self.gddaq_target_run.lstrip('0') or '0'
-                # 尝试匹配: 数字比较
-                matched = None
-                for d in dirs:
-                    if int(d) == int(target):
-                        matched = d
-                        break
-                if matched is None:
-                    return None, f"Run {self.gddaq_target_run} not found"
-                latest_dir = matched
-            else:
-                # 自动取最大编号
-                latest_dir = max(dirs, key=int)
-
-            return os.path.join(self.gddaq_search_dir, latest_dir), latest_dir
-
-        except Exception as e:
+            latest = max(dirs, key=lambda d: (int(d), d))
+            return os.path.join(root, latest), latest
+        except OSError as e:
             return None, str(e)
+
+    @staticmethod
+    def _gddaq_run_identity(base_dir, run_number):
+        """校验轮次标识, 读不到时不能伪造 run 0 (validate folder + run identity)."""
+        if not isinstance(base_dir, str) or not base_dir.strip():
+            raise ValueError("no data folder available")
+        if (type(run_number) is not int
+                and not (isinstance(run_number, str)
+                         and re.fullmatch(r"[0-9]+", run_number))):
+            raise ValueError("invalid or missing run number")
+        run_number = int(run_number)
+        if run_number < 0:
+            raise ValueError("invalid run number")
+        return os.path.realpath(os.path.abspath(base_dir)), run_number
+
+    def _stop_gddaq_recording(self):
+        """Only GDDAQ owns these automatic stops; leave manual runs untouched."""
+        if self.run_stat and self.run_source == "gddaq":
+            self.stop_monitoring(source="gddaq")
+
+    def _start_gddaq_run(self, base_dir, run_number):
+        """轮次变化时换文件, 成功后才提交标识 (switch CSV, then commit identity)."""
+        try:
+            identity = self._gddaq_run_identity(base_dir, run_number)
+        except ValueError as e:
+            self._report_start_error("gddaq", str(e))
+            return False
+        if self.run_stat:
+            if self.run_source != "gddaq":
+                return False
+            if self.gddaq_recording_run == identity:
+                self._show_gddaq_running(identity[1])
+                return True
+            self._stop_gddaq_recording()
+
+        raw_dir, run = identity
+        if not os.path.isdir(raw_dir):
+            self._report_start_error("gddaq", "GDDAQ data directory invalid: " + raw_dir)
+            return False
+        save_dir = os.path.join(os.path.dirname(raw_dir), "CurrentData")
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+        except OSError as e:
+            self._report_start_error("gddaq", "Cannot create save directory: " + str(e))
+            return False
+        self.filename_input.setText(os.path.join(save_dir, f"run_{run:05d}.csv"))
+        self.file_mode = "append"
+        self.file_mode_combo.setCurrentIndex(0)
+        self._gddaq_start_dir = raw_dir
+        try:
+            self.start_monitoring(source="gddaq")
+        finally:
+            self._gddaq_start_dir = None
+        if not self.run_stat:
+            return False
+        self.gddaq_recording_run = identity
+        self._show_gddaq_running(run)
+        return True
+
+    def _show_gddaq_running(self, run):
+        self.gddaq_last_state = "RUNNING"
+        self.save_status_label.setText(
+            f"GDDAQ: Running run_{run:05d}.csv ({self.gddaq_detect_method})")
+        self.save_status_label.setStyleSheet("color: green;")
 
     def _gddaq_max_data_mtime(self, run_dir):
         """
@@ -1678,291 +2641,193 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         return start_time, stop_time, stop_count
 
     def check_gddaq_status(self):
-        """
-        定时检查 GDDAQ 状态 (参考 run_timer.py 的状态机)。
-        状态流转:
-        - IDLE → 检测到 Start 且无 Stop → RUNNING (自动 start_monitoring)
-        - RUNNING → 检测到 Stop → FINISHED (自动 stop_monitoring)
-        - RUNNING → pgrep 失败且无 Stop → CRASHED (自动 stop_monitoring，状态栏提示)
-        - FINISHED → 数据文件比 run.log 新且进程存活 → RUNNING (同文件夹重启取数,
-          自动 start_monitoring 并追加到同一 CSV; 受 ~5MB 落盘缓冲影响检测有滞后)
-        - FINISHED → 出现新 Stop 块但未检测到取数活动 → 记录 WARNING (漏掉的取数段)
-        - 每次轮询记录上次状态，避免重复触发启停
-        """
+        """1 s polling. Log mode follows the highest run, retaining restart heuristics."""
+        if self.gddaq_detect_method == "memory":
+            self.check_gddaq_mem_status()
+            return
+        if not os.path.isdir(self.gddaq_search_dir):
+            if not self.gddaq_dir_invalid_logged:
+                self.log_bus.log("WARNING", "GDDAQ data directory became invalid")
+                self.gddaq_dir_invalid_logged = True
+            self.save_status_label.setText("GDDAQ: data directory invalid!")
+            self.save_status_label.setStyleSheet("color: red;")
+            # Still detect a confirmed process exit when the filesystem is unavailable.
+            if not self.is_gddaq_running():
+                self._stop_gddaq_recording()
+                self.gddaq_last_state = "CRASHED"
+            return
+        self.gddaq_dir_invalid_logged = False
+        run_dir, run_id = self.get_gddaq_run_dir()
+        if run_dir != self._gddaq_last_run_dir:
+            # New run has ownership even if its log/Start has not appeared yet.
+            self._stop_gddaq_recording()
+            self._gddaq_last_run_dir = run_dir
+            self._gddaq_last_parse = None
+            self.gddaq_last_log_mtime = 0
+            self.gddaq_last_state = "IDLE"
+            self.gddaq_follow_stop_count = 0
+            self.gddaq_fin_stop_count = 0
+            self.gddaq_finished_since = None
+            self.gddaq_last_alive_time = None
+            self._start_error_key = None
+            self.save_status_label.setText(f"GDDAQ: {run_id} waiting for Start...")
+            self.save_status_label.setStyleSheet("color: blue;")
+
+        proc_alive = self.is_gddaq_running()
+        if self.gddaq_proc_alive_last is not None and self.gddaq_proc_alive_last != proc_alive:
+            self.log_bus.log("INFO", "GDDAQ process " + ("detected" if proc_alive else "exited"))
+        self.gddaq_proc_alive_last = proc_alive
+        if not proc_alive:
+            if self.gddaq_last_state != "CRASHED":
+                self._stop_gddaq_recording()
+                self.gddaq_last_state = "CRASHED"
+                self.log_bus.log("WARNING", "GDDAQ process not found; recording stopped")
+            self.save_status_label.setText("GDDAQ: process not found! Waiting for restart.")
+            self.save_status_label.setStyleSheet("color: red;")
+            return
+        if run_dir is None:
+            return
+        log_path = os.path.join(run_dir, "run.log")
         try:
-            # 0. 检查数据根目录有效性 (运行期间可能被删除/卸载, 如 NFS 掉线)
-            # Check data root validity (may be deleted/unmounted during a run, e.g. NFS dropout)
-            if not os.path.isdir(self.gddaq_search_dir):
-                if not self.gddaq_dir_invalid_logged:
-                    self.log_bus.log("WARNING",
-                        f"GDDAQ: data directory became invalid: {self.gddaq_search_dir}")
-                    self.gddaq_dir_invalid_logged = True
-                self.save_status_label.setText("GDDAQ: data directory invalid!")
-                self.save_status_label.setStyleSheet("color: red;")
-                return
+            current_log_mtime = os.path.getmtime(log_path)
+        except OSError:
+            return
+        if current_log_mtime != self.gddaq_last_log_mtime or self._gddaq_last_parse is None:
+            self._gddaq_last_parse = self.parse_gddaq_run_log(log_path)
+            self.gddaq_last_log_mtime = current_log_mtime
+        start_time, stop_time, stop_count = self._gddaq_last_parse
+        if start_time is None:
+            return
+        now = datetime.now()
+        self.gddaq_last_alive_time = now
+        if stop_time is None:
+            # Retry every poll when startup failed; no optimistic RUNNING assignment.
+            if self._start_gddaq_run(self.gddaq_search_dir, run_id):
+                self.gddaq_follow_stop_count = stop_count
             else:
-                # 目录恢复有效时重置去重标志, 下次失效可再次记录
-                self.gddaq_dir_invalid_logged = False
+                self.gddaq_last_state = "IDLE"
+            return
 
-            # 1. 获取目标轮次目录
-            run_dir, run_id = self.get_gddaq_run_dir()
-            if run_dir is None:
-                # 目录不存在或无轮次文件夹，保持等待
-                if self.gddaq_last_state != "IDLE":
-                    print(f"GDDAQ: {run_id}")
-                    self.gddaq_last_state = "IDLE"
-                return
+        if self.gddaq_last_state == "RUNNING":
+            if stop_count == self.gddaq_follow_stop_count:
+                return  # following a restarted acquisition; old Stop is not new
+            self._stop_gddaq_recording()
+            self.gddaq_last_state = "FINISHED"
+            self.gddaq_fin_stop_count = stop_count
+            self.gddaq_finished_since = now
+            self.log_bus.log("INFO", f"GDDAQ: run {run_id} segment finished")
+            self.save_status_label.setText(f"GDDAQ: Run {run_id} Finished")
+            self.save_status_label.setStyleSheet("color: green;")
+            return
+        if self.gddaq_last_state != "FINISHED":
+            self._stop_gddaq_recording()
+            self.gddaq_last_state = "FINISHED"
+            self.gddaq_fin_stop_count = stop_count
+            self.gddaq_finished_since = now
+            self.save_status_label.setText(f"GDDAQ: Run {run_id} Finished")
+            self.save_status_label.setStyleSheet("color: green;")
+            return
+        if stop_count > self.gddaq_fin_stop_count:
+            self.log_bus.log("WARNING", f"GDDAQ: missed restarted acquisition in run {run_id} "
+                             "(too short or under one data-flush block)")
+            self.gddaq_fin_stop_count = stop_count
+            self.gddaq_finished_since = now
+            self.save_status_label.setText(f"GDDAQ: Run {run_id} missed a restarted acquisition!")
+            self.save_status_label.setStyleSheet("color: orange;")
+        grace_ok = (self.gddaq_finished_since is None or
+                    (now - self.gddaq_finished_since).total_seconds() > self.gddaq_restart_grace)
+        if (grace_ok and self._gddaq_max_data_mtime(run_dir)
+                > current_log_mtime + self.gddaq_restart_eps):
+            if self._start_gddaq_run(self.gddaq_search_dir, run_id):
+                self.gddaq_follow_stop_count = stop_count
+                self.log_bus.log("INFO", f"GDDAQ: run {run_id} restarted acquisition detected")
+            else:
+                self.gddaq_last_state = "FINISHED"
 
-            # 轮次目录切换时重置解析缓存与 mtime 基准
-            # (Reset parse cache and mtime baseline when the run dir changes)
-            if run_dir != self._gddaq_last_run_dir:
-                self._gddaq_last_run_dir = run_dir
-                self.gddaq_last_log_mtime = 0
-                self._gddaq_last_parse = None
+    def _reset_gddaq_mem_tracking(self):
+        self.gddaq_mem_last_note = None
+        self._gddaq_mem_last_publication = None
+        self._gddaq_mem_last_valid = time.monotonic()
+        self._gddaq_mem_fault = None
 
-            log_path = os.path.join(run_dir, "run.log")
+    def _gddaq_mem_unavailable(self, reason, immediate=False):
+        """错误心跳不能延长 3 秒宽限期 (error heartbeats are not valid DAQ states)."""
+        if not immediate and time.monotonic() - self._gddaq_mem_last_valid < 3.0:
+            self.save_status_label.setText("GDDAQ: waiting for valid memory status (3s grace)...")
+            self.save_status_label.setStyleSheet("color: orange;")
+            return
+        self._stop_gddaq_recording()
+        self.gddaq_last_state = "CRASHED"
+        if self._gddaq_mem_fault != reason:
+            self.log_bus.log("WARNING", "GDDAQ: " + reason)
+            self._gddaq_mem_fault = reason
+        self.save_status_label.setText("GDDAQ: " + reason)
+        self.save_status_label.setStyleSheet("color: red;")
 
-            if not os.path.exists(log_path):
-                # run.log 尚未创建，保持等待
-                return
+    def check_gddaq_mem_status(self):
+        """Follow valid snapshots without a GUI edge gate; retries and recovery are idempotent.
 
-            # 2. 检查 mtime 是否变化 (减少 I/O)
+        The helper publishes once per second. Re-reading one publication never
+        refreshes the monotonic valid-state deadline (3 s). Confirmed death stops
+        immediately; transient read failures keep recording during the grace.
+        """
+        proc = self.gddaq_mem_proc
+        if proc is None or proc.poll() is not None:
+            self._gddaq_mem_unavailable("memory helper exited! Re-connect the link.", immediate=True)
+            return
+        try:
+            with open(self.gddaq_mem_status_path, "r") as f:
+                st = json.load(f)
+            if not isinstance(st, dict):
+                raise ValueError("status is not an object")
+            ts = st.get("ts")
+            if type(ts) not in (int, float) or not math.isfinite(ts):
+                raise ValueError("invalid timestamp")
+            if abs(time.time() - ts) >= 3.0:
+                raise ValueError("stale timestamp")
+        except (OSError, ValueError, TypeError):
+            self._gddaq_mem_unavailable("memory status unavailable for 3s; recording stopped")
+            return
+
+        new_publication = ts != self._gddaq_mem_last_publication
+        self._gddaq_mem_last_publication = ts
+        status = st.get("status")
+        if status == "process_missing":
+            self._gddaq_mem_unavailable("gddaq process not found! Waiting for restart.", immediate=True)
+            return
+        running = st.get("running")
+        note = st.get("note")
+        if note and note != self.gddaq_mem_last_note:
+            self.log_bus.log("WARNING", "GDDAQ memory reader: " + str(note))
+        self.gddaq_mem_last_note = note
+        if status != "ok" or type(running) is not bool:
+            self._gddaq_mem_unavailable("no valid memory state for 3s; recording stopped")
+            return
+        identity = None
+        if running:
+            # rt_runno is the active run; GUI run_number may already show the next one.
             try:
-                current_log_mtime = os.path.getmtime(log_path)
-            except OSError:
+                identity = self._gddaq_run_identity(
+                    st.get("file_folder") or self.gddaq_search_dir, st.get("rt_runno"))
+            except ValueError:
+                self._gddaq_mem_unavailable("invalid run/folder for 3s; recording stopped")
                 return
-
-            log_changed = current_log_mtime > self.gddaq_last_log_mtime
-            if log_changed:
-                self.gddaq_last_log_mtime = current_log_mtime
-
-            # 3. 解析 run.log — 仅在文件变化时重新解析, 避免每秒全量读文件
-            #    (Re-parse only when the log changed; avoids re-reading every second)
-            if log_changed or self._gddaq_last_parse is None:
-                self._gddaq_last_parse = self.parse_gddaq_run_log(log_path)
-            start_time, stop_time, stop_count = self._gddaq_last_parse
-
-            # 4. 检测进程存活
-            proc_alive = self.is_gddaq_running()
-
-            # 4b. 进程存活边沿检测: 跳变时记录日志 (不依赖状态机分支, 任何状态下
-            #     进程出现/退出都能留痕; 首次轮询 None→False 不记录, 避免噪音)
-            #     (Edge detection on process liveness: log on transitions regardless
-            #     of the state machine; first poll None→False is not logged)
-            if self.gddaq_proc_alive_last is not None and self.gddaq_proc_alive_last != proc_alive:
-                if proc_alive:
-                    print(f"GDDAQ: process '{self.gddaq_proc_name}' detected")
-                    self.log_bus.log("INFO", f"GDDAQ: process '{self.gddaq_proc_name}' detected")
-                else:
-                    print(f"GDDAQ: process '{self.gddaq_proc_name}' is no longer running")
-                    self.log_bus.log("INFO", f"GDDAQ: process '{self.gddaq_proc_name}' is no longer running")
-            self.gddaq_proc_alive_last = proc_alive
-
-            # 5. 状态判定 (参考 run_timer.py)
-            now = datetime.now()
-
-            if start_time is None:
-                # 还没有 Start 行，等待中
-                if self.gddaq_last_state != "IDLE":
-                    self.gddaq_last_state = "IDLE"
-                    self.save_status_label.setText(f"GDDAQ: Run {run_id} waiting for Start...")
-                    self.save_status_label.setStyleSheet("color: blue;")
-                return
-
-            if stop_time is not None:
-                # ---- 有 Stop 行 ----
-                if self.gddaq_last_state == "RUNNING":
-                    # 正在跟随一段取数 (首轮或重启段)。stop_count 变化 = 追加了新的
-                    # Stop 块 → 本段结束; 进程消失且无新 Stop → 崩溃
-                    # (Following an acquisition; a changed stop_count means a
-                    #  new Stop block was appended → this segment is over)
-                    if stop_count != self.gddaq_follow_stop_count:
-                        print(f"GDDAQ: Run {run_id} segment FINISHED (new Stop block in run.log)")
-                        self.log_bus.log("INFO", f"GDDAQ: run {run_id} segment finished")
-                        self.gddaq_last_state = "FINISHED"
-                        self.gddaq_fin_stop_count = stop_count
-                        self.gddaq_finished_since = now
-                        # 只停止由 GDDAQ 触发的运行, 不干扰手动启动的运行
-                        # (Only stop runs triggered by GDDAQ; manual runs continue)
-                        if self.run_stat and self.run_source == "gddaq":
-                            self.stop_monitoring(source="gddaq")
-                        self.save_status_label.setText(f"GDDAQ: Run {run_id} Finished")
-                        self.save_status_label.setStyleSheet("color: green;")
-                    elif not proc_alive:
-                        # 跟随重启段期间进程消失且无新 Stop → 视为崩溃
-                        print(f"GDDAQ: Run {run_id} CRASHED during restarted acquisition")
-                        self.log_bus.log("WARNING",
-                            f"GDDAQ: process died during restarted acquisition (run {run_id})")
-                        self.gddaq_last_state = "CRASHED"
-                        if self.run_stat and self.run_source == "gddaq":
-                            self.stop_monitoring(source="gddaq")
-                        self.save_status_label.setText(f"GDDAQ: Run {run_id} CRASHED! Process '{self.gddaq_proc_name}' not found.")
-                        self.save_status_label.setStyleSheet("color: red;")
-                    return
-
-                if self.gddaq_last_state != "FINISHED":
-                    # 首次看到 Stop → 本轮取数结束
-                    print(f"GDDAQ: Run {run_id} FINISHED (Stop detected in run.log)")
-                    self.log_bus.log("INFO", f"GDDAQ: run {run_id} finished")
-                    self.gddaq_last_state = "FINISHED"
-                    self.gddaq_fin_stop_count = stop_count
-                    self.gddaq_finished_since = now
-                    # 只停止由 GDDAQ 触发的运行, 不干扰手动启动的运行
-                    # (Only stop runs triggered by GDDAQ; manual runs continue)
-                    if self.run_stat and self.run_source == "gddaq":
-                        self.stop_monitoring(source="gddaq")
-                    self.save_status_label.setText(f"GDDAQ: Run {run_id} Finished")
-                    self.save_status_label.setStyleSheet("color: green;")
-                    return
-
-                # ---- 已处于 FINISHED: 跟踪同一文件夹内的重启取数 ----
-                # (GUI-Qt 20260709: 重启取数不写新 Start 行, 只在结束时追加 Stop 块,
-                #  因此"重启已开始"只能靠数据文件活动判断)
-                # (Already FINISHED: track same-folder restarts — their start is
-                #  invisible in run.log, only data-file activity reveals them)
-
-                # a) 漏段检测: 出现了新 Stop 块, 但我们从未检测到取数活动
-                #    (段太短, 停止时的收尾落盘与 Stop 块几乎同时到达, 来不及被
-                #    轮询观察到; 多采集卡的 M00/M01... 文件取 max 不受影响)
-                if stop_count > self.gddaq_fin_stop_count:
-                    print(f"GDDAQ: Run {run_id} missed a restarted acquisition (new Stop block, no data activity seen)")
-                    self.log_bus.log("WARNING",
-                        f"GDDAQ: missed restarted acquisition in run {run_id} "
-                        f"(too short or under one data-flush block)")
-                    self.gddaq_fin_stop_count = stop_count
-                    self.gddaq_finished_since = now
-                    self.save_status_label.setText(f"GDDAQ: Run {run_id} missed a restarted acquisition!")
-                    self.save_status_label.setStyleSheet("color: orange;")
-
-                # b) 重启检测: 数据文件比 run.log 新 + 进程存活 + 已过宽限期
-                #    (宽限期用于规避取数收尾时数据落盘与 Stop 块写入的顺序抖动)
-                grace_ok = (
-                    self.gddaq_finished_since is None
-                    or (now - self.gddaq_finished_since).total_seconds() > self.gddaq_restart_grace
-                )
-                data_mtime = self._gddaq_max_data_mtime(run_dir)
-                if (proc_alive and grace_ok
-                        and data_mtime > current_log_mtime + self.gddaq_restart_eps):
-                    print(f"GDDAQ: Run {run_id} restart detected (data files newer than run.log)")
-                    self.log_bus.log("INFO", f"GDDAQ: run {run_id} restarted acquisition detected")
-                    # 先乐观置为 RUNNING; 若启动失败会在下方回退为 FINISHED 以便重试
-                    # (Tentatively RUNNING; rolled back to FINISHED below if start fails)
-                    self.gddaq_last_state = "RUNNING"
-                    self.gddaq_follow_stop_count = stop_count
-
-                    # 保存路径: 与首轮相同, 重启段追加到同一 CSV
-                    # (Same file as the first segment: restarted segments append)
-                    save_dir = os.path.join(self.gddaq_search_dir, "CurrentData")
-                    if not os.path.exists(save_dir):
-                        try:
-                            os.makedirs(save_dir, exist_ok=True)
-                        except Exception as e:
-                            print(f"GDDAQ: Error creating save directory: {e}")
-                            self.log_bus.log("ERROR", f"GDDAQ: cannot create save directory: {e}")
-                            self.gddaq_last_state = "FINISHED"
-                            return
-
-                    run_num = int(run_id)
-                    filename = f"run_{run_num:05d}.csv"
-                    full_path = os.path.join(save_dir, filename)
-
-                    if not self.run_stat:
-                        self.filename_input.setText(full_path)
-                        # 强制追加模式: 重启段追加到同一文件, 且避免在定时器回调中
-                        # 弹出模态覆盖确认框阻塞事件循环 (同 DAQ_Master 逻辑)
-                        # (Force append: segments go into one file; also avoids a
-                        #  modal overwrite-confirm dialog inside a timer callback)
-                        self.file_mode = "append"
-                        self.file_mode_combo.setCurrentIndex(0)
-                        print(f"GDDAQ: Auto-starting monitoring (restart). File: {full_path}")
-                        self.start_monitoring(source="gddaq")
-
-                    if self.run_stat:
-                        self.save_status_label.setText(f"GDDAQ: Running {filename} (restart)")
-                        self.save_status_label.setStyleSheet("color: green;")
-                    else:
-                        # 启动失败 (串口占用/文件不可写等): 回退为 FINISHED,
-                        # 下个轮询周期自动重试
-                        # (Start failed: roll back to FINISHED so the next poll retries)
-                        self.gddaq_last_state = "FINISHED"
-                        self.save_status_label.setText(f"GDDAQ: Run {run_id} start failed, retrying...")
-                        self.save_status_label.setStyleSheet("color: orange;")
-                return
-
-            # 无 Stop 的情况
-            if proc_alive:
-                # 进程存活且无 Stop → 正在运行
-                self.gddaq_last_alive_time = now
-
-                if self.gddaq_last_state != "RUNNING":
-                    print(f"GDDAQ: Run {run_id} RUNNING (Start detected, process alive)")
-                    self.log_bus.log("INFO", f"GDDAQ: run {run_id} started")
-                    # 先乐观置为 RUNNING; 若启动失败会在下方回退为 IDLE 以便重试
-                    # (Tentatively RUNNING; rolled back to IDLE below if start fails)
-                    self.gddaq_last_state = "RUNNING"
-                    # 记录跟随起点: 后续 stop_count 变化即代表本段结束
-                    # (Baseline: a later change in stop_count ends this segment)
-                    self.gddaq_follow_stop_count = stop_count
-
-                    # 生成保存路径: <search_dir>/CurrentData/run_<run_id:05d>.csv
-                    save_dir = os.path.join(self.gddaq_search_dir, "CurrentData")
-                    if not os.path.exists(save_dir):
-                        try:
-                            os.makedirs(save_dir, exist_ok=True)
-                        except Exception as e:
-                            print(f"GDDAQ: Error creating save directory: {e}")
-                            self.log_bus.log("ERROR", f"GDDAQ: cannot create save directory: {e}")
-                            return
-
-                    run_num = int(run_id)
-                    filename = f"run_{run_num:05d}.csv"
-                    full_path = os.path.join(save_dir, filename)
-
-                    # 更新 UI 文件名并启动监控
-                    if not self.run_stat:
-                        self.filename_input.setText(full_path)
-                        # 强制追加模式 (同 DAQ_Master / 重启段逻辑): 联动文件统一追加,
-                        # 且避免在定时器回调中弹出模态覆盖确认框阻塞事件循环
-                        # (Force append, same as DAQ_Master/restart logic: linked
-                        #  files always append; also avoids a modal overwrite
-                        #  confirm inside a timer callback)
-                        self.file_mode = "append"
-                        self.file_mode_combo.setCurrentIndex(0)
-                        print(f"GDDAQ: Auto-starting monitoring. File: {full_path}")
-                        self.start_monitoring(source="gddaq")
-
-                    if self.run_stat:
-                        self.save_status_label.setText(f"GDDAQ: Running {filename}")
-                        self.save_status_label.setStyleSheet("color: green;")
-                    else:
-                        # 启动失败 (串口占用/文件不可写等): 回退为 IDLE,
-                        # 下个轮询周期自动重试, 避免该轮 run 被永久跳过
-                        # (Start failed: roll back to IDLE so the next poll
-                        #  retries instead of skipping this run forever)
-                        self.gddaq_last_state = "IDLE"
-                        self.save_status_label.setText(f"GDDAQ: Run {run_id} start failed, retrying...")
-                        self.save_status_label.setStyleSheet("color: orange;")
-            else:
-                # 进程不存活且无 Stop → 可能崩溃
-                # 参考 run_timer.py: 冻结计时在最后存活时刻
-                if self.gddaq_last_alive_time is None:
-                    self.gddaq_last_alive_time = now
-
-                if self.gddaq_last_state != "CRASHED":
-                    print(f"GDDAQ: Run {run_id} CRASHED (process '{self.gddaq_proc_name}' not found, no Stop in log)")
-                    self.log_bus.log("WARNING", f"GDDAQ: process died (run {run_id})")
-                    self.gddaq_last_state = "CRASHED"
-
-                    if self.run_stat:
-                        self.stop_monitoring(source="gddaq")
-
-                    self.save_status_label.setText(f"GDDAQ: Run {run_id} CRASHED! Process '{self.gddaq_proc_name}' not found.")
-                    self.save_status_label.setStyleSheet("color: red;")
-
-        except Exception as e:
-            print(f"Error checking GDDAQ status: {e}")
-            import traceback
-            traceback.print_exc()
+        if new_publication:
+            self._gddaq_mem_last_valid = time.monotonic()
+        elif time.monotonic() - self._gddaq_mem_last_valid >= 3.0:
+            self._gddaq_mem_unavailable("memory heartbeat unchanged for 3s; recording stopped")
+            return
+        if self._gddaq_mem_fault is not None:
+            self.log_bus.log("INFO", "GDDAQ memory status recovered")
+            self._gddaq_mem_fault = None
+        if running:
+            if not self._start_gddaq_run(*identity):
+                self.gddaq_last_state = "IDLE"
+        else:
+            self._stop_gddaq_recording()
+            self.gddaq_last_state = "FINISHED"
+            self.save_status_label.setText("GDDAQ: Finished (memory)")
+            self.save_status_label.setStyleSheet("color: green;")
 
     # ===================== GDDAQ 联动功能结束 =====================
 
@@ -2280,6 +3145,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
     
     def open_data_file(self):
         """打开数据文件并写入表头"""
+        self._data_file_error = None
         # strip() 去除首尾空白, 避免创建文件名带空格的文件
         # (Strip whitespace: avoids filenames with stray spaces)
         self.filename = self.filename_input.text().strip()
@@ -2292,6 +3158,8 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         try:
             # 检查文件是否存在
             file_exists = os.path.exists(self.filename)
+            needs_header = (self.file_mode == "overwrite" or not file_exists
+                            or os.path.getsize(self.filename) == 0)
             
             # 如果文件存在且模式为覆盖，提示用户确认
             if file_exists and self.file_mode == "overwrite":
@@ -2322,11 +3190,11 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                     needs_newline = True
             
             # 打开文件
-            mode = "w" if (self.file_mode == "overwrite" or not file_exists) else "a"
+            mode = "w" if self.file_mode == "overwrite" else "a"
             self.file_handle = open(self.filename, mode)
             
             # 如果是新文件或覆盖模式，写入表头
-            if mode == "w" or (mode == "a" and not file_exists):
+            if needs_header:
                 # 修改表头以包含双通道数据
                 self.file_handle.write("UTC Timestamp, Run Time (Seconds), Channel 1 Current (mA), Channel 2 Current (mA), Channel 1 Integral (mC), Channel 2 Integral (mC)\n")
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -2340,15 +3208,24 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
                 self.file_handle.write(f"# New dual-channel monitoring session started at {timestamp}\n")
             
+            # Fail startup now if the header/session marker cannot be flushed.
+            # 表头/会话标记落盘失败也属于启动失败, 不能先显示运行中。
+            self.file_handle.flush()
             self.save_status_label.setText(f"Save Status: Saving to {self.filename} ({'Overwrite' if mode == 'w' else 'Append'})")
             self.save_status_label.setStyleSheet("color: green;")
             print(f"Data File Opened: {self.filename} (Mode: {mode})")
             return True
         except Exception as e:
+            # Opening may succeed before header writing fails. Always roll back.
+            if self.file_handle is not None:
+                try:
+                    self.file_handle.close()
+                except Exception:
+                    pass
+                self.file_handle = None
+            self._data_file_error = str(e)
             self.save_status_label.setText(f"Save Status: File Open Failed - {str(e)}")
             self.save_status_label.setStyleSheet("color: red;")
-            print(f"Failed to Open Data File: {e}")
-            self.log_bus.log("ERROR", f"Data file open failed: {e}")
             return False
     
     def close_data_file(self):
@@ -2688,6 +3565,17 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         """获取当前时间戳"""
         return time.time()
     
+    def _report_start_error(self, source, message):
+        """Automatic retries use deduplicated logs; only manual starts show dialogs."""
+        key = (source, message)
+        if source == "manual" or key != self._start_error_key:
+            self.log_bus.log("ERROR", f"Start failed ({source}): {message}")
+            self._start_error_key = key
+        self.save_status_label.setText(f"Start failed: {message}")
+        self.save_status_label.setStyleSheet("color: red;")
+        if source == "manual":
+            QMessageBox.critical(self, "Error", message)
+
     def start_monitoring(self, source="manual"):
         """开始监控
         source: 'manual' / 'daq_master' / 'gddaq' — 标识触发来源, 用于日志"""
@@ -2708,19 +3596,10 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
 
         # GDDAQ 模式下启动前再次校验数据目录有效性 (勾选后目录可能被删除/卸载)
         # Re-validate GDDAQ data directory before starting (it may have become invalid)
-        if self.active_daq_mode == "gddaq":
-            if not self.gddaq_search_dir or not os.path.isdir(self.gddaq_search_dir):
-                self.log_bus.log("ERROR", "Start failed: GDDAQ data directory invalid")
-                if source == "manual":
-                    QMessageBox.critical(self, "Error",
-                        f"GDDAQ data directory is invalid:\n"
-                        f"{self.gddaq_search_dir or '(not set)'}\n"
-                        "Monitoring cannot start. Please check GDDAQ Settings.")
-                else:
-                    # 定时器回调 (GDDAQ联动) 中不弹模态框, 避免阻塞事件循环
-                    # (No modal dialog inside timer callbacks; use the status bar)
-                    self.save_status_label.setText("GDDAQ: data directory invalid, start blocked!")
-                    self.save_status_label.setStyleSheet("color: red;")
+        if source == "gddaq":
+            raw_dir = self._gddaq_start_dir or self.gddaq_search_dir
+            if not raw_dir or not os.path.isdir(raw_dir):
+                self._report_start_error(source, "GDDAQ data directory invalid")
                 return
 
         # 获取串口名/网络地址
@@ -2728,20 +3607,17 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         addr2 = self.port2_input.text().strip()
         
         if not addr1:
-            self.log_bus.log("WARNING", "Start failed: Channel 1 configuration empty")
-            QMessageBox.warning(self, "Warning", "Please Enter Channel 1 Configuration!")
+            self._report_start_error(source, "Please Enter Channel 1 Configuration!")
             return
         if not self.single_channel_mode and not addr2:
-            self.log_bus.log("WARNING", "Start failed: Channel 2 configuration empty")
-            QMessageBox.warning(self, "Warning", "Please Enter Channel 2 Configuration!")
+            self._report_start_error(source, "Please Enter Channel 2 Configuration!")
             return
 
         # 防护: 双通道误配同一端口/地址会导致请求交错、数据错乱且极难排查
         # (Guard: both channels on the same port/address interleaves requests
         #  on one bus and corrupts data in ways that are hard to diagnose)
         if not self.single_channel_mode and addr1 == addr2:
-            self.log_bus.log("WARNING", "Start failed: both channels use the same port/address")
-            QMessageBox.warning(self, "Warning",
+            self._report_start_error(source,
                 "Channel 1 and Channel 2 are configured with the same port/address!\n"
                 "Please use different ports, or enable Single Channel Mode.")
             return
@@ -2775,23 +3651,23 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                     self.socket2.connect((ip2, int(p2)))
 
         except Exception as e:
-            self.log_bus.log("ERROR", f"Start failed: connection: {e}")
-            QMessageBox.critical(self, "Error", f"Connection Failed: {e}")
             # 回滚已建立的连接 (例如 socket1 已连上而 socket2 失败)
             # (Roll back partially-opened connections, e.g. socket1 OK but socket2 failed)
             self._close_connections()
+            self._report_start_error(source, f"Connection Failed: {e}")
             return
 
         # 打开数据文件
         if not self.open_data_file():
-            self.log_bus.log("ERROR", "Start failed: cannot open data file")
-            QMessageBox.critical(self, "Error", "Cannot Open Data File, Monitoring Cannot Start!")
             # 回滚已建立的串口/网络连接, 避免资源占用
             # (Roll back the connections opened above to avoid leaking them)
             self._close_connections()
+            self._report_start_error(source, "Cannot Open Data File: " +
+                                     (self._data_file_error or "open cancelled"))
             return
         
         self.run_stat = True
+        self._start_error_key = None
         self.run_source = source  # 记录触发来源: DAQ 联动只自动停止自己启动的运行
         # 更新菜单状态
         self.start_action.setEnabled(False)
@@ -2922,6 +3798,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
 
         self.run_stat = False
         self.run_source = None  # 运行结束, 清除触发来源
+        self.gddaq_recording_run = None
         self.timer.stop()  # 先停定时器，防止继续调用 send/recv
 
         # 重置 recv 去抖计数器 (Reset recv debounce counters)
@@ -2995,8 +3872,8 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         # 恢复 DAQ 联动菜单 (激活的联动模式保持勾选, 仅恢复可点击)
         # (Re-enable DAQ link menu entries; an active link stays checked,
         #  only clickability is restored)
-        self.daq_connect_action.setEnabled(True)
-        self.gddaq_connect_action.setEnabled(True)
+        self.daq_connect_action.setEnabled(self.active_daq_mode != "gddaq")
+        self.gddaq_connect_action.setEnabled(self.active_daq_mode != "daq_master")
         self.gddaq_settings_action.setEnabled(True)
 
         # 恢复端口输入框和测试按钮 (单通道模式下通道2保持禁用)
@@ -3753,6 +4630,9 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         # 停止 DAQ/GDDAQ 轮询定时器 (Stop DAQ/GDDAQ polling timers)
         self.daq_timer.stop()
         self.gddaq_timer.stop()
+        # 内存法 root helper 清理 (删停止标志 + 信号兜底)
+        # (Stop the memory-mode root helper: stop-file removal + signal fallback)
+        self._stop_gddaq_mem_helper()
         # shutdown 来源: 跳过手动接管确认框, 静默停止 (关闭窗口无法响应模态框)
         # (source='shutdown' skips the manual-override confirmation: a modal
         #  dialog cannot be answered while the window is closing)

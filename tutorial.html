@@ -982,7 +982,7 @@ body {padding: 2em;}
   <body>
   <div class="markdown-body">
     <h1>电流实时监控系统使用教程</h1>
-<p>本教程由 Z.C. Zhang 最后一次修改于2026年9月20日。</p>
+<p>本教程由 Z.C. Zhang 最后一次修改于2026年9月23日。</p>
 <hr>
 <h2>使用教程</h2>
 <h3>1.将电流表通电，然后连接到电脑的USB口，或通过串口服务器TCP Server将数据通过网络传输。</h3>
@@ -1048,18 +1048,34 @@ body {padding: 2em;}
 <li>
 <p><strong>GDDAQ</strong>：与GDDAQ获取程序联动。启用前需先在"Connect to DAQ"-"GDDAQ Settings..."中配置参数：</p>
 <ul>
-<li><strong>Data Directory</strong>：GDDAQ的数据根目录（即存放各轮次文件夹的目录，如<code>/home/rnb/Data/202605ams/raw/</code>）。该目录下应有以数字命名的轮次子文件夹（如<code>0001</code>、<code>0002</code>等），每个子文件夹内包含一个<code>run.log</code>文件。</li>
-<li><strong>Process Name</strong>：GDDAQ的进程名（默认为<code>gddaq</code>），用于通过<code>pgrep -x</code>检测进程是否存活。</li>
-<li><strong>Run Number</strong>：要监控的轮次编号。留空表示自动监控最大编号的轮次（即编号最大的子目录）；填入数字则监控指定轮次。</li>
-</ul>
-<p>启用后程序会每秒轮询指定轮次的<code>run.log</code>文件，解析其中的<code>Start:</code>和<code>Stop</code>行来判断状态：</p>
+<li><strong>Detection Method</strong>：状态检测方式，二选一（联动开启期间不可切换）：
 <ul>
-<li>检测到<code>Start</code>行且进程存活 → 自动开始电流监控。若自动开始失败（如串口被占用），程序会保持等待并在下一秒自动重试，状态栏以橙色提示"start failed, retrying..."。</li>
+<li><strong>run.log (default)</strong>（默认）：解析轮次文件夹内<code>run.log</code>文件的方式，无需额外权限，详见下方"run.log 方式"。</li>
+<li><strong>Process Memory (root)</strong>：直接读取 gddaq 进程内存获取状态的方式，需要 root 权限。勾选启用联动时会<strong>弹出密码框索取 sudo 密码</strong>，用于以 root 启动本程序自带的一个内存读取辅助子进程（密码仅用于本次 sudo 认证，不会被保存或记录）。详见下方"内存读取方式"。</li>
+</ul>
+</li>
+<li><strong>Data Directory</strong>：GDDAQ的数据根目录（即存放各轮次文件夹的目录，如<code>/home/rnb/Data/202605ams/raw/</code>）。该目录下应有以数字命名的轮次子文件夹（如<code>0001</code>、<code>0002</code>等），每个子文件夹内包含一个<code>run.log</code>文件。<strong>run.log 方式下必填</strong>；内存读取方式下可选（仅作为内存中读不到数据目录时的回退）。</li>
+<li><strong>Process Name</strong>：GDDAQ的进程名（默认为<code>gddaq</code>），用于通过<code>pgrep -x</code>检测进程是否存活。仅 run.log 方式使用。</li>
+<li><strong>轮次自动选择</strong>：不提供指定 Run Number 的设置。run.log 方式自动选择最大编号的子目录；内存方式跟随当前实际运行号。</li>
+</ul>
+<p><strong>run.log 方式</strong>（默认）：启用后程序会每秒轮询最大编号轮次的<code>run.log</code>文件，解析其中的<code>Start:</code>和<code>Stop</code>行来判断状态：</p>
+<ul>
+<li>检测到<code>Start</code>行且进程存活 → 自动开始电流监控。若自动开始失败（如串口被占用），程序会保持等待并在下一秒自动重试，状态栏显示具体失败原因，并记录去重错误日志。</li>
 <li>检测到<code>Stop</code>行 → 自动停止电流监控（仅停止由联动自动开始的运行，不干扰手动启动的监控）。</li>
-<li>进程消失（<code>pgrep</code>失败）且<code>run.log</code>中无<code>Stop</code>行 → 判定为崩溃，自动停止监控并在状态栏提示"CRASHED"。</li>
+<li>进程消失（<code>pgrep</code>失败）→ 自动停止联动启动的监控，状态栏显示红色异常提示，并等待 gddaq 恢复。</li>
 <li>同文件夹内重启取数：程序通过"数据文件比<code>run.log</code>新"来检测重启的取数段——检测到后自动再次开始电流监控，并将数据<strong>追加</strong>到该轮次的同一CSV文件中。由于gddaq的数据文件可能每积累一定大小才落盘一次，重启段的自动开始存在明显滞后（最长约一个落盘周期）。若某段取数太短、始终未触发数据落盘，则该段无法被检测到，程序会在状态栏以橙色提示并在日志中记录WARNING。</li>
 </ul>
-<p>所有电流数据文件统一保存在数据根目录下的<code>CurrentData/</code>子文件夹中（如<code>/home/rnb/Data/202605ams/raw/CurrentData/run_00048.csv</code>），不会分散到各轮次文件夹内。</p>
+<p><strong>内存读取方式</strong>（Process Memory, root）：启用后由 root 辅助子进程每秒读取一次 gddaq 进程内存中的运行状态（运行中标志、轮次号、数据目录——来自 gddaq 界面程序的内部数据，无需解析任何文件）：</p>
+<ul>
+<li>状态变化为"运行中" → 自动开始电流监控；变化为"停止" → 自动停止电流监控（同样仅作用于联动自动开始的运行）。由于状态直接来自内存标志位，<strong>不依赖数据文件落盘来检测重启</strong>；仍保持每秒一次轮询，完整发生在两次内存读取之间的短取数段或同轮次短暂停顿仍可能遗漏。</li>
+<li>确认 gddaq 进程退出时立即停止电流记录并显示红色异常提示；辅助进程仍在时，gddaq 恢复后自动跟随。</li>
+<li>状态文件持续更新心跳。短暂读失败继续记录；连续 <strong>3 秒</strong>没有有效状态时，在下一次轮询停止记录并报警。有效状态恢复后自动追加恢复记录，同一份旧状态或持续的错误心跳不会延长该期限。</li>
+<li>若辅助子进程异常退出（如被误杀），立即停止联动记录，状态栏以红色提示"memory helper exited"，需先取消再勾选联动开关（重新输入密码）恢复，不会自动反复索取密码。</li>
+<li>若 gddaq 程序升级/重编译后内部偏移发生变化，程序会在日志中记录 WARNING 并给出诊断提示，此时可在源码目录运行 <code>sudo python3 gddaq_memread.py --check</code> 自检（该脚本是独立的诊断工具，不随打包程序分发）。</li>
+<li>数据目录直接从 gddaq 内存读取，电流数据保存在其上一级目录下的<code>CurrentData/</code>子文件夹中（与 run.log 方式的保存约定一致）。</li>
+</ul>
+<p>两种方式下，电流数据统一追加到数据根目录 <strong>上一级</strong> 的 <code>CurrentData/</code> 中（如 <code>/home/rnb/Data/202605ams/CurrentData/run_00048.csv</code>，与 <code>raw/</code> 同级）。日志方式旧版本保存于 <code>raw/CurrentData/</code> 的文件不会自动搬迁或合并。</p>
+<p>观察到运行号或数据根目录变化时，先关闭旧 CSV，再打开新 CSV；即使两次轮询之间没有观察到 Stop，也不会继续写入旧 run。新轮次尚未写出有效 Start 时，日志模式停止旧记录并等待。所有自动启动失败（目录、设备连接或文件打开）均通过状态栏和去重日志提示，不弹出模态错误框，并在后续轮询重试。</p>
 </li>
 <li>
 <p><strong>联动模式下的手动启停（两种联动通用）</strong>：联动期间启停由外部获取程序主导，任何手动干预都会退出联动模式。</p>
@@ -1067,7 +1083,7 @@ body {padding: 2em;}
 <p><strong>注意</strong>：使用联动模式时不建议覆盖轮次（复用同一轮次编号/文件夹重新取数）。虽然程序已能检测同文件夹内的重启取数段并追加记录，但如上所述其自动开始存在滞后、极短段可能漏检；且同一CSV文件中会混有多段数据，事后与DAQ数据一一对应时更易出错。建议每轮取数都使用新的轮次编号，让每轮取数与电流数据文件一一对应。DAQ_Master联动同理：复用相同的轮次名与编号，会把多轮数据追加进<code>current_data</code>下的同一个文件。</p>
 </blockquote>
 <blockquote>
-<p><strong>注意</strong>：GDDAQ联动功能依赖<code>pgrep</code>命令，目前仅在Linux上可用。</p>
+<p><strong>注意</strong>：GDDAQ 的 run.log 联动方式依赖<code>pgrep</code>命令，目前仅在Linux上可用。</p>
 </blockquote>
 </li>
 </ul>

@@ -1,7 +1,7 @@
 <div style="font-family: Arial, sans-serif; line-height: 1.6;">
 <center>
 <h2 style="color: #2E86AB; margin-bottom: 10px;">Real-Time Current Monitoring System</h2>
-<p><b>Version v1.0.1</b></p>
+<p><b>Version v1.1.0</b></p>
 <p>Compatible with 創鴻高精度智能盤面表 DM4D-An-Rs</p>
 <p><b>Developer:</b> Zhicheng Zhang</p>
 <p><b>Email:</b> <a href="mailto:zhangzhicheng@cnncmail.cn">zhangzhicheng@cnncmail.cn</a></p>
@@ -26,8 +26,13 @@
 
 <div style="margin-left: 15px;">
 
-<h4 style="color: #4A90E2; margin-bottom: 5px;"> v1.0.1 (2026-09-20, Latest)</h4>
+<h4 style="color: #4A90E2; margin-bottom: 5px;"> v1.1.0 (2026-09-23, Latest)</h4>
 <ul style="margin-top: 5px; margin-bottom: 15px;">
+    <li><b>GDDAQ Memory-Read Link Mode:</b> Added a second GDDAQ detection method alongside the existing run.log monitoring. The new "Process Memory (root)" option reads the acquisition state directly from the gddaq process memory, avoiding data-flush delays in restart detection. Both the helper and GUI still poll once per second; transitions entirely between memory samples may be missed.</li>
+    <li><b>GDDAQ Run Selection &amp; Storage:</b> Both methods now select runs automatically (highest numbered folder for run.log; active run for memory), with no manual Run Number setting. CSV files append to <code>&lt;parent of raw&gt;/CurrentData/run_XXXXX.csv</code>. Existing files under <code>raw/CurrentData</code> are not moved or merged.</li>
+    <li><b>GDDAQ Run Boundaries:</b> Observed run/folder changes close the old CSV before starting the new one, even if an intervening Stop was not sampled. A new log-mode run without a valid Start waits with the old recording closed.</li>
+    <li><b>Memory Link Recovery:</b> The helper publishes a heartbeat every second, including unchanged and error states, and reports the active thread run number. Confirmed DAQ/helper exit stops linked recording immediately. Three seconds without a valid state stops recording on the next poll; fresh error heartbeats do not extend this deadline. A live helper resumes following after valid state returns; an exited helper requires manual reconnection.</li>
+    <li><b>Automatic Start Recovery:</b> Optional memory-mode folder configuration now works. Directory, device and CSV failures release resources and remain retryable, with deduplicated logs and no modal error dialogs. Memory offsets and one-second polling remain unchanged.</li>
     <li><b>GDDAQ Restart Tracking:</b> Same-folder restarts are detected by data files newer than run.log and auto-resumed into the same run_XXXXX.csv, with flush-delay/missed-short-segment limits, an orange hint + WARNING, a 10 s post-Stop grace and 2 s freshness threshold, and crash handling if gddaq disappears.</li>
     <li><b>Bug Fix &mdash; GDDAQ File Mode:</b> Runs auto-started by GDDAQ now force append mode (same as DAQ_Master): a pre-existing <code>run_XXXXX.csv</code> is never silently overwritten, and no modal overwrite-confirmation dialog can appear inside the polling timer callback.</li>
     <li><b>Bug Fix &mdash; GDDAQ Stop Scope:</b> A Stop block in <code>run.log</code> (or a process crash) now only stops runs that were auto-started by GDDAQ. Manually started monitoring is no longer interrupted, consistent with DAQ_Master behavior.</li>
