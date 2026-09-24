@@ -44,8 +44,13 @@ import json
 #  script files needed in packaged builds.)
 # ======================================================================
 
-# 默认偏移 (本仓库 gddaq 二进制的实证值; 可用 --off-xxx 覆盖)
-# (Default offsets, reverse-engineered from the gddaq binary; overridable)
+# 已验证的适配目标; 同版本重新编译后仍可能需要重新验证布局。
+# Validated target; a rebuilt binary of the same version may need revalidation.
+GDDAQ_DEFAULT_VERSION = "caen_20260709"
+GDDAQ_VERSIONS = {GDDAQ_DEFAULT_VERSION: "GDDAQ-CAEN (20260709)"}
+
+# CAEN 默认偏移 (已验证二进制的实证值; 可用 --off-xxx 覆盖)
+# (Validated CAEN offsets; overridable)
 GDDAQ_DEF_OFF = dict(
     folder=0x158, prefix=0x160, run=0x168,
     lefolder=0x170, lerun=0x180,
@@ -575,6 +580,9 @@ def gddaq_mem_helper_main(argv):
     ap.add_argument("--stop-file", required=True,
                     help="停止标志: 该文件被删除即退出")
     ap.add_argument("--pid", type=int, default=None)
+    ap.add_argument("--gddaq-version", choices=tuple(GDDAQ_VERSIONS),
+                    default=GDDAQ_DEFAULT_VERSION,
+                    help="内存布局适配版本 (默认: %(default)s)")
     ap.add_argument("--scan-budget", type=float, default=30.0)
     ap.add_argument("--vptr-mw", type=lambda x: int(x, 0), default=GDDAQ_DEF_VT["mainwindow"])
     ap.add_argument("--vptr-rt", type=lambda x: int(x, 0), default=GDDAQ_DEF_VT["readoutthread"])
@@ -611,7 +619,8 @@ def gddaq_mem_helper_main(argv):
     state = {}
     lastkey = None
     last_err = None
-    _gddaq_hprint("gddaq-mem-helper started (pid=%d)" % os.getpid())
+    _gddaq_hprint("gddaq-mem-helper started (pid=%d, version=%s)"
+                  % (os.getpid(), args.gddaq_version))
     while True:
         # 停止标志被删除 → 干净退出
         if not os.path.exists(stop_path):
@@ -1397,13 +1406,14 @@ class MonitorSettingsDialog(QDialog):       #类: 设置对话框
         super().accept()
 
 class GDDAQSettingsDialog(QDialog):      # 类: GDDAQ 设置对话框
-    def __init__(self, search_dir, proc_name, method="log", parent=None):
+    def __init__(self, search_dir, proc_name, method="log", parent=None,
+                 version=GDDAQ_DEFAULT_VERSION):
         super().__init__(parent)
         self.setWindowTitle("GDDAQ Settings")
         self.resize(450, 220)
-        self.init_ui(search_dir, proc_name, method)
+        self.init_ui(search_dir, proc_name, method, version)
 
-    def init_ui(self, search_dir, proc_name, method):
+    def init_ui(self, search_dir, proc_name, method, version):
         layout = QtWidgets.QFormLayout()
 
         # 0. 检测方式: run.log 解析 (默认) / 进程内存读取 (需 root)
@@ -1423,6 +1433,17 @@ class GDDAQSettingsDialog(QDialog):      # 类: GDDAQ 设置对话框
         # (Memory mode relies on a root helper; switching is guarded while linked)
         self.method_combo.currentIndexChanged.connect(self._on_method_changed)
         layout.addRow("Detection Method:", self.method_combo)
+
+        # 内存布局版本仅在断开联动时可选 (memory profile, locked while linked).
+        self.version_combo = QComboBox()
+        for version_id, label in GDDAQ_VERSIONS.items():
+            self.version_combo.addItem(label, userData=version_id)
+        self.version_combo.setCurrentIndex(max(0, self.version_combo.findData(version)))
+        self.version_combo.setToolTip(
+            "Memory mode only; disconnect the GDDAQ link before changing versions.\n"
+            "This identifies the target GDDAQ version. Rebuilt binaries of the same "
+            "version may require offset revalidation.")
+        layout.addRow("GDDAQ Version:", self.version_combo)
 
         # 1. 数据根目录 (带 Browse 按钮)
         self.search_dir_input = QLineEdit(search_dir)
@@ -1501,6 +1522,8 @@ class GDDAQSettingsDialog(QDialog):      # 类: GDDAQ 设置对话框
         proc_name = self.proc_name_input.text().strip()
         method = self.method_combo.currentData() if hasattr(self, "method_combo") else "log"
         self.proc_name_input.setEnabled(method == "log")
+        linked = getattr(self.parent(), "active_daq_mode", None) == "gddaq"
+        self.version_combo.setEnabled(method == "memory" and not linked)
 
         if method == "log" and (not search_dir or not proc_name):
             reason = "Data Directory and Process Name are required."
@@ -1530,11 +1553,12 @@ class GDDAQSettingsDialog(QDialog):      # 类: GDDAQ 设置对话框
             self.search_dir_input.setText(chosen)
 
     def get_values(self):
-        """获取设置值 (search_dir, proc_name, method)"""
+        """获取设置值 (search_dir, proc_name, method, version)"""
         return (
             self.search_dir_input.text().strip(),
             self.proc_name_input.text().strip() or "gddaq",
-            self.method_combo.currentData() or "log"
+            self.method_combo.currentData() or "log",
+            self.version_combo.currentData()
         )
 
 class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
@@ -1688,6 +1712,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         # (GDDAQ detection method: "log" parses run.log (default); "memory" reads
         #  the gddaq process memory via a root helper started on link activation)
         self.gddaq_detect_method = "log"
+        self.gddaq_version = GDDAQ_DEFAULT_VERSION  # 当前会话内保留 (session only)
         # 内存法 root helper (--gddaq-mem-helper, sudo 常驻子进程) 相关状态
         # (State for the memory-mode root helper subprocess)
         self.gddaq_mem_proc = None           # sudo 子进程句柄 (None = 未运行)
@@ -2106,10 +2131,11 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.gddaq_search_dir,
             self.gddaq_proc_name,
             self.gddaq_detect_method,
-            self
+            self,
+            version=self.gddaq_version
         )
         if dialog.exec_() == QDialog.Accepted:
-            search_dir, proc_name, method = dialog.get_values()
+            search_dir, proc_name, method, version = dialog.get_values()
 
             # 检测方式不可在联动开启期间切换 (log/memory 的轮询循环与
             # helper 生命周期不同, 中途切换会造成状态混乱)
@@ -2121,16 +2147,23 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                     "Disconnect the GDDAQ link first (the running method was kept).")
                 method = self.gddaq_detect_method
 
+            if version != self.gddaq_version and self.active_daq_mode == "gddaq":
+                QMessageBox.warning(self, "Warning",
+                    "GDDAQ version cannot be changed while the GDDAQ link is active.\n"
+                    "Disconnect the GDDAQ link first (the current version was kept).")
+                version = self.gddaq_version
+
             self.gddaq_search_dir = search_dir
             self.gddaq_proc_name = proc_name
             self.gddaq_detect_method = method
+            self.gddaq_version = version
             print(f"GDDAQ Settings Updated: dir={self.gddaq_search_dir or '(none)'}, "
                   f"proc={self.gddaq_proc_name}, "
-                  f"method={self.gddaq_detect_method}")
+                  f"method={self.gddaq_detect_method}, version={self.gddaq_version}")
             self.log_bus.log("INFO",
                 f"GDDAQ settings applied: dir={self.gddaq_search_dir}, "
                 f"proc={self.gddaq_proc_name}, "
-                f"method={self.gddaq_detect_method}")
+                f"method={self.gddaq_detect_method}, version={self.gddaq_version}")
 
     def _gddaq_mem_paths(self):
         """确定内存法状态/停止文件路径 (用户私有目录, 避免 /tmp 世界可写路径被劫持)
@@ -2204,6 +2237,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                 return False   # 用户取消 (user cancelled)
 
             cmd = [sudo_bin, "-S", "-p", ""] + helper_cmd + [
+                "--gddaq-version", self.gddaq_version,
                 "-i", "1",
                 "-o", status_path,
                 "--stop-file", stop_path]

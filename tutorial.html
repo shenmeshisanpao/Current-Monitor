@@ -982,144 +982,282 @@ body {padding: 2em;}
   <body>
   <div class="markdown-body">
     <h1>电流实时监控系统使用教程</h1>
-<p>本教程由 Z.C. Zhang 最后一次修改于2026年9月23日。</p>
-<hr>
+<p>本教程介绍 <code>cur_raw.py</code> 的操作方法，包括连接电流表、记录数据、设置状态提醒，以及与 DAQ 数据获取程序联动。</p>
+<p>作者：Z.C. Zhang。本文修订于 2026 年 9 月 24 日。</p>
+<p>首次使用时，请先按“使用教程”完成一次手动采集，确认连接、单位和保存位置正确，再根据需要配置额外功能。</p>
 <h2>使用教程</h2>
-<h3>1.将电流表通电，然后连接到电脑的USB口，或通过串口服务器TCP Server将数据通过网络传输。</h3>
-<h3>2. 在菜单栏"Connection"选择串口模式还是TCP网络模式。</h3>
-<h3>3. 在主界面"Channel 1 ..."和"Channel 2 ..."后分别填入连接电流表的两个USB串口名或IP地址和端口，点击后面的"Test"按钮进行连接测试。如果只有一个电流表，可在菜单栏"Run"-"Single Channel Mode (CH1 Only)"切换到单表模式，此时仅Channel 1可用。</h3>
-<blockquote>
-<p><strong>注意</strong>：双通道模式下，两个通道不能填写相同的串口名或 IP:Port（两路请求会在同一总线上交错，导致数据错乱且难以排查），程序会拒绝这样的配置并给出提示。</p>
-</blockquote>
+<h3>1. 连接电流表</h3>
+<p>给电流表通电，然后根据设备的连接方式接入电脑：</p>
 <ul>
-<li><strong>获取USB串口名的方法如下：</strong></li>
+<li><strong>USB 串口连接</strong>：将电流表连接到电脑的 USB 接口。</li>
+<li><strong>TCP 网络连接</strong>：通过串口服务器传输数据，并在串口服务器中配置 TCP Server 模式。</li>
 </ul>
-<p>在Terminal里输入命令ls /dev/ttyUSB*，查看已连接的USB串口。如果已连接的USB太多，难以确定哪个是电流表，还可以通过如下方法：</p>
-<p>1.在连接电流表前，打开Terminal，输入如下命令：</p>
-<pre class="language-text"><code class="language-text code-highlight"><span class="code-line line-number" line="1">dmesg -w
+<h3>2. 选择连接方式和通道数量</h3>
+<p>在菜单栏 <strong>Connection</strong> 中选择串口模式或 <strong>TCP Network Mode</strong>，使其与实际接线方式一致。</p>
+<p>程序默认使用双通道。如果只连接了一台电流表，请选择 <strong>Run → Single Channel Mode (CH1 Only)</strong>，或按 <code>Ctrl+Shift+S</code> 切换到单通道模式。此时只需配置 Channel 1，Channel 2 不参与采集。</p>
+<h3>3. 填写连接地址并测试</h3>
+<p>在主界面的 <strong>Channel 1</strong> 和 <strong>Channel 2</strong> 输入框中，分别填写对应电流表的连接地址，再点击旁边的 <strong>Test</strong> 按钮测试连接。</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>连接方式</th><th>填写内容</th><th>示例</th></tr></thead><tbody><tr><td>USB 串口</td><td>串口设备名</td><td><code>/dev/ttyUSB0</code></td></tr><tr><td>TCP 网络</td><td>IP 地址和端口，以冒号分隔</td><td><code>192.168.1.100:4001</code></td></tr></tbody></table>
+<p>表中的地址仅用于说明格式，请替换为实际设备地址。网络地址和端口可在串口服务器的配置页面中查看。</p>
+<p>双通道模式下，两个通道必须使用不同的串口或不同的 <code>IP:Port</code>。程序会拒绝重复地址，以免两路请求在同一连接上相互干扰。</p>
+<p><strong>在 Linux 下查找 USB 串口</strong></p>
+<p>打开终端，执行以下命令，查看系统已识别的 USB 串口：</p>
+<pre class="language-bash"><code class="language-bash code-highlight"><span class="code-line line-number" line="1"><span class="token function">ls</span> /dev/ttyUSB*
 </span></code></pre>
-<p>2. 连接电流表</p>
-<p>3. 观察输出信息，通常会显示类似：</p>
-<pre class="language-text"><code class="language-text code-highlight"><span class="code-line line-number" line="1">[  123.456] usb 1-1: new full-speed USB device using xhci_hcd and address 2
-</span><span class="code-line line-number" line="2">[  123.789] usb 1-1: New USB device found, idVendor=xxxx, idProduct=xxxx
-</span><span class="code-line line-number" line="3">[  124.012] usb 1-1: USB serial device converter now attached to ttyUSB0
+<p>如果存在多个设备，无法确定哪个串口属于电流表，可以在插入电流表之前运行：</p>
+<pre class="language-bash"><code class="language-bash code-highlight"><span class="code-line line-number" line="1"><span class="token function">dmesg</span> <span class="token parameter variable">-w</span>
 </span></code></pre>
-<p>这样就能看到USB设备被分配到了 <code>/dev/ttyUSB0</code> 串口。</p>
+<p>随后连接电流表，观察新增信息。例如，下面这行表示设备被分配到了 <code>/dev/ttyUSB0</code>：</p>
+<pre class="language-text"><code class="language-text code-highlight"><span class="code-line line-number" line="1">[  124.012] usb 1-1: USB serial device converter now attached to ttyUSB0
+</span></code></pre>
+<p>确认设备名后，按 <code>Ctrl+C</code> 结束查看，再将完整路径填入程序。如果系统提示无权读取内核日志，可使用 <code>sudo dmesg -w</code>。</p>
+<h3>4. 核对单位和采集参数</h3>
+<p>开始采集前，打开 <strong>Run → Set Channel Units</strong>，为每个通道选择电流表实际输出的单位：<code>mA</code>、<code>μA</code> 或 <code>nA</code>。单位设置会影响读数换算和电荷积分，必须与电流表一致。</p>
+<p>串口波特率默认为 <strong>9600</strong>。如果设备使用其他波特率，请通过 <strong>Run → Set Baud Rate</strong> 修改。读取间隔默认为 <strong>100 ms</strong>，可在 <strong>Run → Set Update Interval</strong> 中调整。</p>
+<h3>5. 设置数据保存位置</h3>
+<p>在 <strong>Save File Name</strong> 中填写 CSV 文件的路径和名称，也可以使用浏览按钮选择位置。默认文件名为 <code>Run_0000.csv</code>；未指定目录时，文件保存在程序的当前工作目录中，该目录不一定是脚本所在目录。</p>
+<p>如果同名文件已经存在，可通过 <strong>File Mode</strong> 选择保存方式：</p>
 <ul>
-<li><strong>获取IP地址和端口的方法如下：</strong></li>
+<li><strong>追加（Append，默认）</strong>：保留已有内容，将本次数据写到文件末尾。</li>
+<li><strong>覆盖（Overwrite）</strong>：重新写入文件。程序会在覆盖已有文件前要求确认。</li>
 </ul>
-<p>查看串口服务器的后台设置。</p>
-<h3>4. 在"Save File Name"处设置记录文件的位置和文件名，默认保存在“程序文件夹/Run_0000.csv“。如果记录文件已存在，可以在"File Mode"处选择追加或覆盖，默认为追加模式。</h3>
-<h3>5. 准备就绪，点击"Start Monitoring"按钮（Ctrl+R）开始监控。程序会自动积分电荷量、自动保存到文件。监控运行期间，端口输入框、"Test"按钮、文件名/浏览/保存模式等控件会被禁用（本次运行的配置已锁定，修改不会生效），停止监控后自动恢复。</h3>
-<h3>6. 点击"Stop Monitoring"（Ctrl+T）按钮停止监控。如果文件名是以四位数字为结尾的话，停止监控后，会自动 +1。</h3>
-<h3>7. 若要继续，重复第4-6步。</h3>
+<p>建议每轮采集使用独立的文件名。需要检查保存位置时，可选择 <strong>File → Open Data Folder</strong> 打开数据文件夹。</p>
+<h3>6. 开始监控</h3>
+<p>点击 <strong>Start Monitoring</strong>，或按 <code>Ctrl+R</code>。成功启动后，程序会更新电流读数和曲线、累计电荷量，并自动将数据写入 CSV 文件。请同时查看 <strong>Save Status</strong>，确认文件已正常打开。</p>
+<p>运行期间，连接地址、测试按钮、保存路径和保存模式等控件会被锁定。需要修改这些设置时，请先停止监控。</p>
+<p>曲线使用各通道所选的电流单位，电荷积分统一以 <strong>mC</strong> 显示。将鼠标悬停在曲线上，可以查看数据点的信息。</p>
+<h3>7. 停止监控并开始下一轮</h3>
+<p>点击 <strong>Stop Monitoring</strong>，或按 <code>Ctrl+T</code>。程序会停止读取并关闭数据文件，随后恢复可修改的设置。</p>
+<p>如果文件名在 <code>.csv</code> 前以“下划线＋四位数字”结尾，停止后输入框中的编号会自动加 1。例如，<code>Run_0000.csv</code> 会变为 <code>Run_0001.csv</code>。不符合这一格式的文件名保持不变。</p>
+<p>开始下一轮前，请重新确认文件名和保存模式，再点击 <strong>Start Monitoring</strong>。每次启动都会重新计算本次运行时间和累计电荷；即使追加到同一文件，也不会接着上一轮的积分值累加。</p>
 <h2>额外功能</h2>
-<ol>
-<li>
-<p>在电流监控运行期间，用户可以点击"Create Snapshot"按钮（快捷键Ctrl+S）保存当前记录文件的副本到记录文件同文件夹下。</p>
-</li>
-<li>
-<p>在菜单栏"File"-"Open Data Folder"可以打开记录文件所在的文件夹。</p>
-</li>
-<li>
-<p>在菜单栏"Run"-"Set Update Interval"可以设置读取电流的间隔，默认为100 ms。</p>
-</li>
-<li>
-<p>在菜单栏"Run"-"Pulse Reminder"可以开启/关闭打脉冲提醒（Ctrl+Shift+P），默认关闭。</p>
-</li>
-<li>
-<p>默认为双表模式，可在菜单栏"Run"-"Single Channel Mode (CH1 Only)"切换到单表模式（Ctrl+Shift+S）。</p>
-</li>
-<li>
-<p>鼠标悬停在曲线上可以查看该点信息。</p>
-</li>
-<li>
-<p>在菜单栏"Run"-"Set Channel Units"中可以设置电流表的单位(mA, μA, nA)。</p>
-</li>
-<li>
-<p>在菜单栏"Run"-"Set Current Threshold"中可以为每个通道设置电流过滤阈值。读数换算为 mA 后与阈值比较：绝对值超过阈值、或为 NaN/Inf 的无效读数将被丢弃，不显示、不计入电荷积分、不写入文件。过滤以帧为单位：任一通道的读数无效时整帧丢弃，以保证 CSV 中双通道数据对齐。阈值设为 <strong>0 表示禁用该通道的过滤</strong>。</p>
-</li>
-<li>
-<p>在菜单栏"Run"-"Connect to DAQ"下可选择与获取程序联动，实现同步启停和自动命名保存文件。提供两种互斥的联动模式，同一时间只能启用一种，也可都不启用。</p>
+<h3>保存快照与查看数据文件</h3>
+<p>监控运行期间，点击 <strong>Create Snapshot</strong> 或按 <code>Ctrl+S</code>，可将当前数据文件复制到同一文件夹中。快照文件名带有创建时间，并附加运行时间、电荷积分等说明，便于在采集过程中留存阶段性结果。</p>
+<p>快照保存的是创建时的数据；主记录文件仍会继续更新。可通过 <strong>File → Open Data Folder</strong> 查看原始文件和快照。</p>
+<p>CSV 文件中的电流统一换算为 <strong>mA</strong>，电荷积分统一使用 <strong>mC</strong>，与界面选择的显示单位无关。各列含义如下：</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>列名</th><th>含义</th></tr></thead><tbody><tr><td><code>UTC Timestamp</code></td><td>Unix 时间戳，单位为秒</td></tr><tr><td><code>Run Time (Seconds)</code></td><td>本次监控启动后的运行时间，单位为秒</td></tr><tr><td><code>Channel 1 Current (mA)</code></td><td>通道 1 电流</td></tr><tr><td><code>Channel 2 Current (mA)</code></td><td>通道 2 电流；单通道模式下为 0</td></tr><tr><td><code>Channel 1 Integral (mC)</code></td><td>通道 1 本次运行的累计电荷</td></tr><tr><td><code>Channel 2 Integral (mC)</code></td><td>通道 2 本次运行的累计电荷；单通道模式下为 0</td></tr></tbody></table>
+<p>文件中以 <code>#</code> 开头的行是会话或快照说明。使用数据分析软件导入时，应将这些行作为注释跳过。</p>
+<h3>过滤异常电流读数</h3>
+<p>打开 <strong>Run → Set Current Threshold</strong>，为每个通道设置电流上限，并选择阈值单位。程序会将读数和阈值统一换算为 mA 后比较：电流绝对值超过上限时，该次读数会被丢弃。</p>
+<p>过滤以一次采集的整组数据为单位。在双通道模式下，只要任一通道读数无效，本次两个通道的数据都不会显示、写入文件或参与积分，以保持 CSV 中的双通道数据对齐。</p>
+<p>阈值设为 <strong>0</strong> 表示关闭该通道的幅值上限过滤；<code>NaN</code>、<code>Inf</code> 等无效数值仍会被丢弃。</p>
+<h3>设置状态指示灯和报警音</h3>
+<p>主界面中，每个通道的电流读数旁都有状态指示灯。它根据采集到的有效读数判断信号状态：</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>状态</th><th>含义</th></tr></thead><tbody><tr><td><strong>RUN</strong>（绿色）</td><td>当前未触发信号异常提醒</td></tr><tr><td><strong>PEAK</strong>（红色闪烁）</td><td>电流幅值相对历史基准明显升高，仅用于直流模式</td></tr><tr><td><strong>DROP</strong>（橙色闪烁）</td><td>电流幅值相对历史基准明显降低，仅用于直流模式</td></tr><tr><td><strong>ZERO</strong>（深红色闪烁）</td><td>电流幅值低于零值阈值，并满足当前模式的报警条件</td></tr><tr><td><strong>STOP</strong>（灰色）</td><td>未在监控</td></tr><tr><td><strong>OFF</strong></td><td>通道或该通道的状态监控已禁用</td></tr></tbody></table>
+<p>点击指示灯可以手动清除当前的 PEAK、DROP 或 ZERO 警告。如果后续读数仍满足报警条件，警告可能再次出现。连接中断时还应查看日志，不能仅凭指示灯判断设备是否正常通信。</p>
+<p>打开 <strong>Run → Status Monitor Settings</strong>，可分别配置两个通道的状态监控。对话框顶部的 <strong>Alarm Sound</strong> 是全局报警音开关，默认开启；出现 ZERO 状态时，每 3 秒播放一次系统提示音，状态恢复后停止。</p>
+<p><strong>监测直流信号</strong></p>
+<p>启用 <strong>Enable Status Monitor</strong>，保持 <strong>Pulse Mode</strong> 未勾选，再根据正常信号范围调整以下参数：</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>参数</th><th>设置作用</th></tr></thead><tbody><tr><td><strong>History Window</strong></td><td>历史窗口长度，单位为秒；窗口内的电流幅值用于计算基准线</td></tr><tr><td><strong>Zero Threshold</strong></td><td>零值阈值；电流绝对值低于此值时触发 ZERO</td></tr><tr><td><strong>Threshold Mode</strong></td><td>选择按幅值差或百分比判断突变</td></tr><tr><td><strong>Value Threshold</strong></td><td>按幅值差判断时使用的阈值</td></tr><tr><td><strong>Percent Threshold</strong></td><td>按百分比判断时使用的阈值</td></tr><tr><td><strong>Warning Hold Time</strong></td><td>PEAK、DROP 警告的保持时间</td></tr></tbody></table>
+<p>设置电流阈值时，请留意输入框标示的单位。程序内部会将这些阈值换算为 mA 保存。</p>
+<p><strong>监测脉冲信号</strong></p>
+<p>对于周期性脉冲，正常的低电平阶段也可能接近零。此时可勾选 <strong>Pulse Mode</strong>，跳过 PEAK、DROP 检测，只在电流绝对值持续低于 <strong>Zero Threshold</strong>、且时间超过 <strong>Zero Timeout</strong> 时触发 ZERO。</p>
+<p><strong>Zero Timeout</strong> 默认是 <strong>3.0 秒</strong>，仅在脉冲模式下生效。设置时，应使其长于正常脉冲的低电平持续时间，避免把正常间隔误判为信号丢失。</p>
+<h3>开启打脉冲提醒</h3>
+<p>通过 <strong>Run → Pulse Reminder</strong> 或 <code>Ctrl+Shift+P</code> 开启、关闭打脉冲提醒，默认关闭。这项功能用于提醒操作人员施加脉冲，与状态监控中的 <strong>Pulse Mode</strong> 分别设置。</p>
+<p>若在启动监控前开启提醒，程序会在开始监控约 10 秒后弹出提示。可以选择 <strong>No More in This Run</strong>，取消本轮后续提醒；也可以选择 <strong>Remind in 5 Minutes</strong>，在 5 分钟后再次提醒。提醒窗口打开时，采集仍会继续。</p>
+<h3>与 DAQ 数据获取程序联动</h3>
+<p>联动功能让电流监控跟随外部数据获取程序自动启停，并按轮次命名保存文件。使用前，请先完成电流表连接测试和单位设置。</p>
+<p>在 <strong>Run → Connect to DAQ</strong> 中选择 <strong>DAQ_Master</strong> 或 <strong>GDDAQ</strong>。两种联动互斥，同一时间只能启用一种；均不启用时，使用前文介绍的手动采集方式。</p>
+<p>联动期间，保存路径和文件名由外部轮次信息决定，会替代 <strong>Save File Name</strong> 中手动填写的内容。</p>
+<h4>使用 DAQ_Master 联动</h4>
+<p>选择 <strong>DAQ_Master</strong>，与 “DAQ_Master for BNU LAMBDA” 联动。程序会监测 <code>/tmp/daq_status.txt</code> 的变化，根据其中的状态自动启停。</p>
+<p>电流数据按轮次名和编号命名，保存在 DAQ 的 ROOT 数据文件所在目录下的 <code>current_data/</code> 文件夹中。例如，轮次名为 <code>run</code>、编号为 <code>180</code> 时，电流文件名为 <code>run_00180.csv</code>。</p>
+<p>如果没有响应，请确认所用 DAQ_Master 版本支持更新 <code>/tmp/daq_status.txt</code>，并检查文件是否随取数状态变化。文件格式见文末附录。</p>
+<h4>配置 GDDAQ 联动</h4>
+<p>启用 <strong>GDDAQ</strong> 前，先打开 <strong>Run → Connect to DAQ → GDDAQ Settings...</strong>，完成以下设置：</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>设置项</th><th>填写或选择方法</th></tr></thead><tbody><tr><td><strong>Detection Method</strong></td><td>选择 <code>run.log (default)</code> 或 <code>Process Memory (root)</code>；联动开启期间不能切换</td></tr><tr><td><strong>GDDAQ Version</strong></td><td>仅内存方式使用，目前支持 <code>GDDAQ-CAEN (20260709)</code>；只能在联动关闭时选择，选择在当前会话内保留</td></tr><tr><td><strong>Data Directory</strong></td><td>数据根目录，例如 <code>/home/rnb/Data/202605ams/raw/</code>；日志方式必填，内存方式可作为目录读取失败时的回退</td></tr><tr><td><strong>Process Name</strong></td><td>日志方式用来检测进程的名称，默认为 <code>gddaq</code></td></tr></tbody></table>
+<p>数据根目录指存放各轮次子文件夹的目录，而非某一轮次的文件夹。例如，<code>raw/</code> 下可以包含 <code>0001/</code>、<code>0002/</code>，每个轮次文件夹内有自己的 <code>run.log</code>。</p>
+<p>程序会自动选择轮次，无需填写 Run Number：日志方式选择编号最大的子文件夹，内存方式跟随实际运行号。</p>
+<h4>GDDAQ：通过 run.log 检测状态</h4>
+<p>这是默认方式，无需额外的 root 权限。程序每秒检查一次最大编号轮次中的 <code>run.log</code>，结合 <code>gddaq</code> 进程是否存在来判断取数状态。进程检测依赖 <code>pgrep</code>，本程序的这一联动方式目前用于 Linux。</p>
+<p>正常操作时，在 GDDAQ 中开始或停止取数即可：</p>
 <ul>
-<li>
-<p><strong>DAQ_Master</strong>：与获取程序"DAQ_Master for BNU LAMBDA"联动。启用后程序会监控<code>/tmp/daq_status.txt</code>文件的变化，自动同步启停，并根据轮次名和编号自动命名、保存文件到root文件同目录下的<code>current_data</code>文件夹中（联动期间"Save File Name"中手动设置的路径会被自动覆盖）。如失效，请确保使用了最新版的"DAQ_Master"获取程序。DAQ程序应可以自动修改<code>/tmp/daq_status.txt</code>以被读取状态。</p>
-</li>
-<li>
-<p><strong>GDDAQ</strong>：与GDDAQ获取程序联动。启用前需先在"Connect to DAQ"-"GDDAQ Settings..."中配置参数：</p>
+<li>检测到有效 <code>Start:</code> 记录且进程存在时，自动启动电流监控。</li>
+<li>检测到后续 <code>Stop</code> 记录时，自动停止由联动启动的电流监控。</li>
+<li>检测到进程退出时，停止联动记录，显示红色异常提示，并等待 GDDAQ 恢复。</li>
+</ul>
+<p>如果自动启动失败，例如串口被占用，程序会在后续轮询中重试。具体原因会显示在状态栏，并写入日志；相同错误不会持续重复刷屏。</p>
+<p><strong>在同一轮次文件夹中重新开始取数时，需要留意检测延迟。</strong> GDDAQ 可能不会再次写入 <code>Start:</code>，程序因而需要通过“数据文件比 <code>run.log</code> 更新”来识别重启。</p>
+<p>这种检测依赖数据写入磁盘，可能延迟约一个数据写盘周期。如果某段取数很短，未产生可识别的文件更新，该段可能漏记；检测到可能漏记的情况时，程序会显示橙色提示，并记录 WARNING。</p>
+<h4>GDDAQ：通过进程内存检测状态</h4>
+<p>选择 <strong>Process Memory (root)</strong> 后，程序会通过辅助子进程，每秒读取一次 GDDAQ 的运行状态、轮次号和数据目录。</p>
+<p>启用联动时会弹出密码框，请输入 sudo 密码，用于以 root 权限启动内存读取辅助进程。密码仅用于本次认证，不会被保存或记录。</p>
+<p>检测到运行状态后，程序自动开始记录；检测到停止状态后，自动停止联动记录。这种方式无需等待数据写盘即可识别重启，但仍有每秒一次的轮询间隔：完整发生在两次读取之间的短取数段或短暂停顿仍可能遗漏。</p>
+<p>使用过程中，异常状态按以下方式处理：</p>
 <ul>
-<li><strong>Detection Method</strong>：状态检测方式，二选一（联动开启期间不可切换）：
-<ul>
-<li><strong>run.log (default)</strong>（默认）：解析轮次文件夹内<code>run.log</code>文件的方式，无需额外权限，详见下方"run.log 方式"。</li>
-<li><strong>Process Memory (root)</strong>：直接读取 gddaq 进程内存获取状态的方式，需要 root 权限。勾选启用联动时会<strong>弹出密码框索取 sudo 密码</strong>，用于以 root 启动本程序自带的一个内存读取辅助子进程（密码仅用于本次 sudo 认证，不会被保存或记录）。详见下方"内存读取方式"。</li>
+<li><strong>确认 GDDAQ 已退出</strong>：在检测到退出时停止联动记录并显示红色提示。辅助进程仍正常运行时，GDDAQ 恢复后可自动继续跟随。</li>
+<li><strong>暂时读不到有效状态</strong>：短暂失败期间继续记录；连续 3 秒没有有效状态后，在下一次轮询停止并报警。恢复有效状态后，可自动以追加方式恢复记录。</li>
+<li><strong>辅助进程退出</strong>：停止联动记录，并提示 <code>memory helper exited</code>。请取消再重新勾选 GDDAQ 联动，输入密码后恢复；程序不会自动反复索取密码。</li>
 </ul>
-</li>
-<li><strong>Data Directory</strong>：GDDAQ的数据根目录（即存放各轮次文件夹的目录，如<code>/home/rnb/Data/202605ams/raw/</code>）。该目录下应有以数字命名的轮次子文件夹（如<code>0001</code>、<code>0002</code>等），每个子文件夹内包含一个<code>run.log</code>文件。<strong>run.log 方式下必填</strong>；内存读取方式下可选（仅作为内存中读不到数据目录时的回退）。</li>
-<li><strong>Process Name</strong>：GDDAQ的进程名（默认为<code>gddaq</code>），用于通过<code>pgrep -x</code>检测进程是否存活。仅 run.log 方式使用。</li>
-<li><strong>轮次自动选择</strong>：不提供指定 Run Number 的设置。run.log 方式自动选择最大编号的子目录；内存方式跟随当前实际运行号。</li>
-</ul>
-<p><strong>run.log 方式</strong>（默认）：启用后程序会每秒轮询最大编号轮次的<code>run.log</code>文件，解析其中的<code>Start:</code>和<code>Stop</code>行来判断状态：</p>
-<ul>
-<li>检测到<code>Start</code>行且进程存活 → 自动开始电流监控。若自动开始失败（如串口被占用），程序会保持等待并在下一秒自动重试，状态栏显示具体失败原因，并记录去重错误日志。</li>
-<li>检测到<code>Stop</code>行 → 自动停止电流监控（仅停止由联动自动开始的运行，不干扰手动启动的监控）。</li>
-<li>进程消失（<code>pgrep</code>失败）→ 自动停止联动启动的监控，状态栏显示红色异常提示，并等待 gddaq 恢复。</li>
-<li>同文件夹内重启取数：程序通过"数据文件比<code>run.log</code>新"来检测重启的取数段——检测到后自动再次开始电流监控，并将数据<strong>追加</strong>到该轮次的同一CSV文件中。由于gddaq的数据文件可能每积累一定大小才落盘一次，重启段的自动开始存在明显滞后（最长约一个落盘周期）。若某段取数太短、始终未触发数据落盘，则该段无法被检测到，程序会在状态栏以橙色提示并在日志中记录WARNING。</li>
-</ul>
-<p><strong>内存读取方式</strong>（Process Memory, root）：启用后由 root 辅助子进程每秒读取一次 gddaq 进程内存中的运行状态（运行中标志、轮次号、数据目录——来自 gddaq 界面程序的内部数据，无需解析任何文件）：</p>
-<ul>
-<li>状态变化为"运行中" → 自动开始电流监控；变化为"停止" → 自动停止电流监控（同样仅作用于联动自动开始的运行）。由于状态直接来自内存标志位，<strong>不依赖数据文件落盘来检测重启</strong>；仍保持每秒一次轮询，完整发生在两次内存读取之间的短取数段或同轮次短暂停顿仍可能遗漏。</li>
-<li>确认 gddaq 进程退出时立即停止电流记录并显示红色异常提示；辅助进程仍在时，gddaq 恢复后自动跟随。</li>
-<li>状态文件持续更新心跳。短暂读失败继续记录；连续 <strong>3 秒</strong>没有有效状态时，在下一次轮询停止记录并报警。有效状态恢复后自动追加恢复记录，同一份旧状态或持续的错误心跳不会延长该期限。</li>
-<li>若辅助子进程异常退出（如被误杀），立即停止联动记录，状态栏以红色提示"memory helper exited"，需先取消再勾选联动开关（重新输入密码）恢复，不会自动反复索取密码。</li>
-<li>若 gddaq 程序升级/重编译后内部偏移发生变化，程序会在日志中记录 WARNING 并给出诊断提示，此时可在源码目录运行 <code>sudo python3 gddaq_memread.py --check</code> 自检（该脚本是独立的诊断工具，不随打包程序分发）。</li>
-<li>数据目录直接从 gddaq 内存读取，电流数据保存在其上一级目录下的<code>CurrentData/</code>子文件夹中（与 run.log 方式的保存约定一致）。</li>
-</ul>
-<p>两种方式下，电流数据统一追加到数据根目录 <strong>上一级</strong> 的 <code>CurrentData/</code> 中（如 <code>/home/rnb/Data/202605ams/CurrentData/run_00048.csv</code>，与 <code>raw/</code> 同级）。日志方式旧版本保存于 <code>raw/CurrentData/</code> 的文件不会自动搬迁或合并。</p>
-<p>观察到运行号或数据根目录变化时，先关闭旧 CSV，再打开新 CSV；即使两次轮询之间没有观察到 Stop，也不会继续写入旧 run。新轮次尚未写出有效 Start 时，日志模式停止旧记录并等待。所有自动启动失败（目录、设备连接或文件打开）均通过状态栏和去重日志提示，不弹出模态错误框，并在后续轮询重试。</p>
-</li>
-<li>
-<p><strong>联动模式下的手动启停（两种联动通用）</strong>：联动期间启停由外部获取程序主导，任何手动干预都会退出联动模式。</p>
-<blockquote>
-<p><strong>注意</strong>：使用联动模式时不建议覆盖轮次（复用同一轮次编号/文件夹重新取数）。虽然程序已能检测同文件夹内的重启取数段并追加记录，但如上所述其自动开始存在滞后、极短段可能漏检；且同一CSV文件中会混有多段数据，事后与DAQ数据一一对应时更易出错。建议每轮取数都使用新的轮次编号，让每轮取数与电流数据文件一一对应。DAQ_Master联动同理：复用相同的轮次名与编号，会把多轮数据追加进<code>current_data</code>下的同一个文件。</p>
-</blockquote>
-<blockquote>
-<p><strong>注意</strong>：GDDAQ 的 run.log 联动方式依赖<code>pgrep</code>命令，目前仅在Linux上可用。</p>
-</blockquote>
-</li>
-</ul>
-</li>
-<li>
-<p>主界面每个通道的读数旁有一个<strong>状态指示灯</strong>，实时反映该通道的信号状态：</p>
-<ul>
-<li><strong>RUN</strong>（绿）：信号正常。</li>
-<li><strong>PEAK</strong>（红，闪烁）/ <strong>DROP</strong>（橙，闪烁）：信号突变（仅直流模式）。</li>
-<li><strong>ZERO</strong>（深红，闪烁）：信号为零或丢失，若开启报警音会同步响铃。</li>
-<li><strong>STOP</strong>（灰）：未监控；单通道模式下 CH2 显示 <strong>OFF</strong>。</li>
-<li>点击指示灯可手动清除 PEAK/DROP/ZERO 警告。</li>
-</ul>
-<p>在菜单栏"Run"-"Status Monitor Settings"中可对状态监控进行设置。对话框顶部有全局报警音开关，下方每个通道可独立配置：</p>
-<ul>
-<li><strong>Alarm Sound</strong>：全局开关（默认开启）。开启后，任一通道处于ZERO状态时，每3秒播放一次系统提示音（beep），直到状态恢复。</li>
-<li><strong>Enable Status Monitor</strong>：是否启用该通道的状态监控。</li>
-<li><strong>History Window</strong>：历史数据窗口长度（秒），用于计算直流模式下的基准线。</li>
-<li><strong>Zero Threshold</strong>：零值判定阈值。直流模式下电流低于此值报警ZERO，电流恢复后指示灯自动转回RUN、报警音自动停止；脉冲模式下作为信号是否为零的判定阈值。</li>
-<li><strong>Pulse Mode</strong>：脉冲模式开关。勾选后跳过突变检测（PEAK/DROP），仅检测信号丢失。适用于脉冲信号（如1Hz梯形脉冲），避免脉冲low期间的误报。</li>
-<li><strong>Zero Timeout</strong>：脉冲模式下零值持续超时时间（秒，默认3.0）。电流持续为零超过此时间才报警ZERO，未超时则视为正常的脉冲low期。仅在勾选Pulse Mode时生效。</li>
-<li><strong>Threshold Mode / Value Threshold / Percent Threshold</strong>：直流模式下的突变检测参数，脉冲模式下不生效。</li>
-<li><strong>Warning Hold Time</strong>：直流模式下警告（PEAK/DROP）的保持时间。</li>
-</ul>
-</li>
-<li>
-<p>在菜单栏"Run"-"Set Baud Rate"中可以设置串口的波特率，默认为 9600。</p>
-</li>
-<li>
-<p><strong>日志栏与日志窗口</strong>：主界面最底部（绘图区下方）有一行高的日志栏，显示最近一条日志。点击它会打开日志窗口（Event Log）。</p>
-<ul>
-<li>
-<p>日志窗口是<strong>非模态</strong>的：打开后仍可正常操作主程序，也可以把它放到主窗口下层。窗口最多保留最近 <strong>100 条</strong>日志（从软件启动时开始记录），满 100 条后再产生新日志时会自动删除最早的一条。按设计<strong>不提供清除按钮</strong>。日志只保存在内存中，关闭软件后即清空，不写入文件。</p>
-</li>
-<li>
-<p>日志格式为 <code>[时间] [级别] 内容</code>，并按重要性用颜色区分：</p>
+<p>内存状态需要持续更新；重复读取同一份旧状态，或持续收到错误状态，都不会延长上述 3 秒等待期。</p>
+<p>目前适配目标为 <strong>GDDAQ-CAEN (20260709)</strong>。同一版本重新编译后，内部布局也可能变化，因此版本名称相同不代表一定兼容。若日志提示内存读取异常，可在源码目录运行以下诊断命令：</p>
+<pre class="language-bash"><code class="language-bash code-highlight"><span class="code-line line-number" line="1"><span class="token function">sudo</span> python3 gddaq_memread.py <span class="token parameter variable">--check</span>
+</span></code></pre>
+<p><code>gddaq_memread.py</code> 是独立诊断工具，不随打包程序分发；使用这一命令需要源码中的脚本。</p>
+<h4>确认 GDDAQ 数据的保存位置</h4>
+<p>两种 GDDAQ 检测方式都将电流数据追加到数据根目录<strong>上一级</strong>的 <code>CurrentData/</code> 文件夹中。例如：</p>
+<pre class="language-text"><code class="language-text code-highlight"><span class="code-line line-number" line="1">/home/rnb/Data/202605ams/
+</span><span class="code-line line-number" line="2">├── raw/                         ← Data Directory
+</span><span class="code-line line-number" line="3">│   └── 0048/
+</span><span class="code-line line-number" line="4">│       └── run.log
+</span><span class="code-line line-number" line="5">└── CurrentData/
+</span><span class="code-line line-number" line="6">    └── run_00048.csv             ← 电流数据
+</span></code></pre>
+<p>内存方式优先使用从 GDDAQ 读取的数据目录。旧版日志方式保存在 <code>raw/CurrentData/</code> 中的文件不会自动搬迁或合并。</p>
+<p>当运行号或数据根目录改变时，程序会先关闭旧 CSV，再打开新 CSV。日志方式若发现新轮次尚无有效的 <code>Start:</code>，会停止旧记录并等待。目录、设备连接或文件打开失败时，可查看状态栏和日志；程序会在后续轮询重试。</p>
+<h4>联动期间如何手动接管</h4>
+<p>联动期间，启停由外部数据获取程序控制。手动启动会要求确认退出联动；手动停止时，如果外部程序仍在取数，也会要求确认。确认接管后，程序退出联动；取消确认则保持原状态。</p>
+<p>每轮取数建议使用新的轮次编号。同一编号重复取数会将多段电流数据追加到同一个 CSV，增加事后对应数据的难度；日志检测方式还存在前述重启延迟和短段漏检问题。</p>
+<p>DAQ_Master 也应遵循这一命名习惯：复用相同轮次名和编号，会继续向 <code>current_data/</code> 下的同名文件追加数据。</p>
+<h3>查看事件日志与排查问题</h3>
+<p>主界面绘图区下方的日志栏显示最近一条事件。点击它可打开 <strong>Event Log</strong> 窗口；窗口打开时，仍可正常操作主程序。</p>
+<p>日志从软件启动时开始记录，最多保留最近 <strong>100 条</strong>，超出后自动移除最早的记录。日志保存在内存中，关闭软件后清空，不会写入磁盘，也不提供清除按钮。</p>
+<p>每条日志采用 <code>[时间] [级别] 内容</code> 的格式，并用颜色区分级别：</p>
 
 
 
@@ -1145,41 +1283,80 @@ body {padding: 2em;}
 
 
 
-<table><thead><tr><th>级别</th><th>颜色</th><th>含义</th></tr></thead><tbody><tr><td><strong>INFO</strong></td><td>灰色</td><td>一般事件与成功操作</td></tr><tr><td><strong>WARNING</strong></td><td>橙色</td><td>警告，如串口/网络测试失败、数据文件为空导致快照失败等</td></tr><tr><td><strong>ERROR</strong></td><td>红色</td><td>错误，如连接失败、数据文件打开/关闭失败、快照创建失败等</td></tr></tbody></table>
-</li>
-<li>
-<p>记录的内容包括但不限于：软件启动与关闭、开始/停止监控、各项设置的 Apply、串口与网络测试的成败、快照创建成功或失败、数据文件读写异常、DAQ/GDDAQ 状态异常等。</p>
-</li>
-<li>
-<p>GDDAQ 联动模式启用期间，每当轮询检测到 GDDAQ 进程<strong>启动</strong>（出现）或<strong>退出</strong>（消失）时，会各记录一条 INFO 日志（如 <code>GDDAQ: process 'gddaq' detected</code> / <code>GDDAQ: process 'gddaq' is no longer running</code>），与状态机的轮次日志相互独立。</p>
-</li>
-<li>
-<p>其中<strong>开始和停止监控会标明触发来源</strong>，便于区分是人工操作还是联动自动触发：<code>(manual)</code> 表示手动点击按钮；<code>(daq_master)</code> 和 <code>(gddaq)</code> 分别表示由 DAQ_Master 或 GDDAQ 联动自动触发；<code>(daq_disabled)</code> 表示因取消勾选联动开关而停止；<code>(shutdown)</code> 表示关闭程序窗口时自动停止。</p>
-</li>
-<li>
-<p>若某个通道连续约 5 秒没有收到有效数据（例如串口线松动），会记录一条 WARNING；数据恢复正常后再记录一条 INFO。该提示经过去抖处理，不会因偶发丢包而反复刷屏。</p>
-</li>
-<li>
-<p>若某通道持续收到 CRC 校验或帧格式错误的响应（约 5 秒以上），会记录一条 WARNING 提示"repeated frame CRC/format errors (check baud rate/wiring)"，与无数据超时的警告相区分，便于定位波特率不匹配或接线问题；恢复正常后记录一条 INFO。该提示同样经过去抖处理。</p>
-</li>
-<li>
-<p>注意：状态监控（Status Monitor）的 PEAK/DROP/ZERO 告警<strong>不会</strong>记入日志，仍仅由主界面上的状态指示灯显示；CSV 逐行写入、绘图刷新等高频操作同样不记录，以免日志被迅速填满。</p>
-</li>
-</ul>
-</li>
-</ol>
-<p>DAQ_Master模式中的<code>/tmp/daq_status.txt</code>文件格式如下：</p>
-<p>当DAQ停止运行时</p>
+<table><thead><tr><th>级别</th><th>颜色</th><th>含义</th></tr></thead><tbody><tr><td><strong>INFO</strong></td><td>灰色</td><td>一般事件或操作成功</td></tr><tr><td><strong>WARNING</strong></td><td>橙色</td><td>需要检查的异常，例如连接测试失败或持续无响应</td></tr><tr><td><strong>ERROR</strong></td><td>红色</td><td>操作失败，例如连接失败、文件打开失败或快照创建失败</td></tr></tbody></table>
+<p>日志包含监控启停、设置应用、连接测试、快照操作和联动异常等信息。启停日志中的括号标明触发来源：</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>标记</th><th>触发来源</th></tr></thead><tbody><tr><td><code>manual</code></td><td>手动操作</td></tr><tr><td><code>daq_master</code></td><td>DAQ_Master 联动</td></tr><tr><td><code>gddaq</code></td><td>GDDAQ 联动</td></tr><tr><td><code>daq_disabled</code></td><td>取消联动</td></tr><tr><td><code>shutdown</code></td><td>关闭程序窗口</td></tr></tbody></table>
+<p>GDDAQ 日志检测方式还会在检测到进程出现或消失时记录 INFO，帮助判断问题是否来自获取程序退出。</p>
+<p>遇到数据不更新时，可以先查看以下提示，再检查相应设置：</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>提示或现象</th><th>建议检查</th></tr></thead><tbody><tr><td><code>no data for ~5s</code></td><td>检查电流表供电、串口线或网络连接，以及设备是否被其他程序占用</td></tr><tr><td><code>repeated frame CRC/format errors</code></td><td>检查波特率和接线；设备持续返回了校验或格式不正确的响应</td></tr><tr><td><code>Save Status</code> 显示文件打开或写入失败</td><td>检查保存目录、写入权限和磁盘可用空间</td></tr><tr><td><code>memory helper exited</code></td><td>取消后重新启用 GDDAQ 内存联动</td></tr></tbody></table>
+<p>持续无响应、CRC 校验或帧格式错误通常在约 5 秒后产生 WARNING，恢复后记录 INFO。这类提示会合并重复异常，避免偶发通信问题反复刷屏。</p>
+<p>PEAK、DROP、ZERO 仅通过状态指示灯和相应报警音提示，不写入事件日志。逐行保存和绘图刷新也不会产生事件日志，因此排查时应同时观察读数、指示灯、保存状态和日志。</p>
+<h2>附录：DAQ_Master 状态文件格式</h2>
+<p>DAQ_Master 通过 <code>/tmp/daq_status.txt</code> 向电流监控程序提供状态。通常由 DAQ_Master 自动更新此文件，用户无需手动编辑。</p>
+<p>停止取数时，文件内容为：</p>
 <pre class="language-text"><code class="language-text code-highlight"><span class="code-line line-number" line="1">STATUS: STOPPED
 </span></code></pre>
-<p>当DAQ正在运行时</p>
+<p>正在取数时，前四行依次为状态、轮次名、轮次号和 ROOT 数据文件路径。例如：</p>
 <pre class="language-text"><code class="language-text code-highlight"><span class="code-line line-number" line="1">STATUS: RUNNING
-</span><span class="code-line line-number" line="2">轮次名（一般为run）
-</span><span class="code-line line-number" line="3">轮次号（如 180）
-</span><span class="code-line line-number" line="4">DAQ保存root文件的完整地址（如 ./12Cag/target1/raw/target1_180.root）
-</span><span class="code-line line-number" line="5">电流数据将自动保存到该文件同目录下的current_data文件夹中
+</span><span class="code-line line-number" line="2">run
+</span><span class="code-line line-number" line="3">180
+</span><span class="code-line line-number" line="4">./12Cag/target1/raw/target1_180.root
 </span></code></pre>
-<hr>
+<p>以上示例对应的电流文件名为 <code>run_00180.csv</code>，保存在该 ROOT 文件所在目录下的 <code>current_data/</code> 文件夹中。相对路径应能从电流监控程序的当前工作目录正确解析。</p>
   </div>
   </body>
 </html>
