@@ -1,7 +1,7 @@
 <div style="font-family: Arial, sans-serif; line-height: 1.6;">
 <center>
 <h2 style="color: #2E86AB; margin-bottom: 10px;">Real-Time Current Monitoring System</h2>
-<p><b>Version 1.1.0</b></p>
+<p><b>Version 1.1.1</b></p>
 <p>Supported meter: 創鴻高精度智能盤面表 DM4D-An-Rs</p>
 <p><b>Developer:</b> ZhiCheng Zhang</p>
 <p><b>Email:</b> <a href="mailto:zhangzhicheng@cnncmail.cn">zhangzhicheng@cnncmail.cn</a></p>
@@ -25,7 +25,22 @@
 
 <div style="margin-left: 15px;">
 
-<h4 style="color: #4A90E2; margin-bottom: 5px;">v1.1.0 (2026-09-23; updated 2026-09-24)</h4>
+<h4 style="color: #4A90E2; margin-bottom: 5px;">v1.1.1 (2026-11-12)</h4>
+<ul style="margin-top: 5px; margin-bottom: 15px;">
+    <li><b>DAQ_Master run changes:</b> A changed output-file identity closes the old CSV and resets the charge integrals, even when the Stop signal between runs was missed.</li>
+    <li><b>DAQ_Master startup recovery:</b> Failed automatic starts remain pending for retry. Directory, device, and CSV startup failures no longer display a green Running status.</li>
+    <li><b>Persistent save errors:</b> Write, flush, and file-close failures are logged and remain visible in red across DAQ polls, stop events, and snapshots. A successful new recording session clears the warning; missing samples are not reconstructed.</li>
+    <li><b>Clock-independent timing:</b> Charge integration, elapsed runtime, plot and hover times, snapshot runtime, and status-monitor deadlines use a monotonic clock. CSV UTC timestamps still use the system clock.</li>
+    <li><b>Threshold precision:</b> Fixed rounding and range clipping when reopening current-filter and status-monitor settings. Current inputs retain a physical resolution of 0.0001 nA; switching filter units converts the displayed value.</li>
+    <li><b>Short history windows:</b> Fixed spike detection remaining in INIT when the configured history holds only one sample.</li>
+    <li><b>GDDAQ log recovery:</b> Failed run.log reads are no longer cached as valid results. Polling retries after temporary read failures without requiring another file modification.</li>
+    <li><b>GDDAQ scan budgets:</b> The helper forwards --scan-budget to memory scanning, shares the budget across object searches, and checks elapsed time within scan regions. Invalid budget values are rejected.</li>
+    <li><b>Single-instance locking:</b> Kept the lock file after releasing it to prevent concurrent launches from locking different files at the same path.</li>
+    <li><b>Pulse Reminder cleanup:</b> Stopping recording, disabling reminders, or closing the application dismisses the reminder and stops its timer. Callbacks from old dialogs cannot affect a later run.</li>
+</ul>
+<p style="color: #666;">Fix validation: 95 offline automated cases passed, including 43 new regression and control cases. Physical meters, live GDDAQ memory layouts, and Windows were not tested in this validation.</p>
+
+<h4 style="color: #4A90E2; margin-bottom: 5px;">v1.1.0 (2026-09-23)</h4>
 <ul style="margin-top: 5px; margin-bottom: 15px;">
     <li><b>GDDAQ memory detection:</b> Added <b>Process Memory (root)</b> alongside <code>run.log</code> monitoring. It reads acquisition state directly from GDDAQ, so restart detection does not depend on data being written to disk.</li>
     <li><b>Detection interval:</b> Memory state is sampled once per second. Short runs or pauses that occur entirely between samples may still be missed.</li>

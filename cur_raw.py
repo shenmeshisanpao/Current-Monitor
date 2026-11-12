@@ -264,41 +264,55 @@ def _gddaq_find_by_vptr(mem, vptr, groups, budget=30.0):
     """在给定区域里找对象头 (第 0 个字 == vptr), 一组命中即停"""
     pat = struct.pack("<Q", vptr)
     found = []
-    t0 = time.time()
+    t0 = time.monotonic()
     over = False
     hit_group = None
     CH = 8 << 20
     for label, regions in groups:
-        if time.time() - t0 > budget:
+        if time.monotonic() - t0 >= budget:
             over = True
             break
         for lo, hi in regions:
             a = lo
             prev = b""
             while a < hi:
+                if time.monotonic() - t0 >= budget:
+                    over = True
+                    break
                 n = min(CH, hi - a)
                 buf = mem.read(a, n)
+                if time.monotonic() - t0 >= budget:
+                    over = True
+                    break
                 if not buf:
                     a += n
                     prev = b""
                     continue
                 i = 0
                 while True:
+                    if time.monotonic() - t0 >= budget:
+                        over = True
+                        break
                     j = buf.find(pat, i)
                     if j < 0:
                         break
                     found.append(a + j)
                     i = j + 1
+                if over:
+                    break
                 if prev:                      # 跨块边界的匹配
                     j = (prev + buf).find(pat)
                     if j >= 0:
                         found.append(a - len(prev) + j)
                 prev = buf[-16:]
                 a += len(buf)
+            if over:
+                break
         if found:
             hit_group = label
+        if found or over:
             break
-    return sorted(set(found)), dict(seconds=time.time() - t0, budget_hit=over,
+    return sorted(set(found)), dict(seconds=time.monotonic() - t0, budget_hit=over,
                                     group=hit_group)
 
 
@@ -463,10 +477,11 @@ def _gddaq_resolve(pid, off, vptr_mw, vptr_rt, mem=None, scan_budget=30.0):
             mem.close()
 
 
-def _gddaq_mem_snapshot(pid, off, vptr_mw, vptr_rt, state):
+def _gddaq_mem_snapshot(pid, off, vptr_mw, vptr_rt, state, scan_budget=30.0):
     """读一次 gddaq 状态, 返回 dict (供守护循环写入状态文件)"""
     st = dict(pid=pid, running=None, run_number=None, file_folder=None,
               file_prefix=None, ts=time.time())
+    deadline = time.monotonic() + scan_budget
 
     mem = state.get("mem")
     if mem is None or state.get("pid") != pid:
@@ -479,7 +494,8 @@ def _gddaq_mem_snapshot(pid, off, vptr_mw, vptr_rt, state):
 
     mw = state.get("mw")
     if mw is None:
-        best, ctx = _gddaq_resolve(pid, off, vptr_mw, vptr_rt, mem=mem)
+        best, ctx = _gddaq_resolve(pid, off, vptr_mw, vptr_rt, mem=mem,
+                                 scan_budget=max(0.0, deadline - time.monotonic()))
         state["ctx"] = ctx
         if best is None:
             st["note"] = "没定位到 MainWindow 实例 (gddaq 版本可能已变化)"
@@ -517,7 +533,9 @@ def _gddaq_mem_snapshot(pid, off, vptr_mw, vptr_rt, state):
         hit = None
         if vptr_rt_real:
             groups = _gddaq_scan_groups(mem)
-            found, _st = _gddaq_find_by_vptr(mem, vptr_rt_real, groups, budget=10.0)
+            found, _st = _gddaq_find_by_vptr(
+                mem, vptr_rt_real, groups,
+                budget=max(0.0, min(10.0, deadline - time.monotonic())))
             if found:
                 hit = found[0]
         if hit:
@@ -589,6 +607,8 @@ def gddaq_mem_helper_main(argv):
     for k, v in GDDAQ_DEF_OFF.items():
         ap.add_argument("--off-" + k.replace("_", "-"), type=lambda x: int(x, 0), default=v)
     args = ap.parse_args(argv)
+    if not 0 <= args.scan_budget < float("inf"):
+        ap.error("--scan-budget must be finite and non-negative")
 
     off = dict(GDDAQ_DEF_OFF)
     for k in list(GDDAQ_DEF_OFF):
@@ -661,7 +681,8 @@ def gddaq_mem_helper_main(argv):
                 state = {}
 
         try:
-            st = _gddaq_mem_snapshot(pid, off, args.vptr_mw, args.vptr_rt, state)
+            st = _gddaq_mem_snapshot(pid, off, args.vptr_mw, args.vptr_rt,
+                                     state, args.scan_budget)
         except Exception as e:
             msg = "%s: %s" % (type(e).__name__, e)
             if msg != last_err:   # 同一错误去重, 避免每轮刷屏
@@ -741,7 +762,7 @@ rcParams['grid.alpha'] = 0.7
 
 # 应用版本号 (与 about.html 中显示的版本保持一致)
 # Application version (kept in sync with the version shown in about.html)
-VERSION = "v1.1.0"
+VERSION = "v1.1.1"
 
 # 单位到 mA 的转换系数 (模块级常量, 供主窗口与设置对话框共用)
 # (Unit-to-mA conversion factors, shared by the main window and settings dialogs)
@@ -750,6 +771,30 @@ UNIT_FACTORS = {
     "μA": 0.001,
     "nA": 0.000001
 }
+
+
+class CurrentSpinBox(QtWidgets.QDoubleSpinBox):
+    """Current input with a fixed physical resolution of 0.0001 nA."""
+
+    def __init__(self, value_ma, unit="mA", maximum_ma=99999.0):
+        super().__init__()
+        self.unit = "mA"
+        self.maximum_ma = max(maximum_ma, value_ma)
+        self.setDecimals(10)
+        self.setRange(0.0, self.maximum_ma)
+        self.setValue(value_ma)
+        self.set_unit(unit)
+
+    def value_ma(self):
+        return self.value() * UNIT_FACTORS[self.unit]
+
+    def set_unit(self, unit):
+        value_ma = self.value_ma()
+        self.unit = unit
+        factor = UNIT_FACTORS[unit]
+        self.setDecimals(10 + round(math.log10(factor)))
+        self.setRange(0.0, self.maximum_ma / factor)
+        self.setValue(value_ma / factor)
 
 # CRC calculation function
 def calculate_crc(data):
@@ -890,15 +935,15 @@ class SingleInstanceLock:
                 else: # Linux 解锁
                     fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
                 
-                self.lock_file.close()
-                try:
-                    os.remove(self.lock_file_path)
-                except Exception:
-                    pass
             except Exception:
                 pass
             finally:
-                self.lock_file = None
+                # Keep the inode: unlinking after unlock lets concurrent
+                # instances acquire locks on two different files at this path.
+                try:
+                    self.lock_file.close()
+                finally:
+                    self.lock_file = None
 
 class LogBus(QtCore.QObject):   # 类: 日志总线 (单例, 发布-订阅)
     """日志总线：单例，收集最近 100 条日志并通过信号广播更新。
@@ -1123,7 +1168,7 @@ class StatusMonitor:    # 类: 监控逻辑核心
         self.is_running = True
         self.history.clear()
         self.warning_state = "RUN"
-        self.last_nonzero_time = time.time()  # 初始化为当前时间，避免启动瞬间误报
+        self.last_nonzero_time = time.monotonic()
 
     def stop(self):
         self.is_running = False
@@ -1153,7 +1198,7 @@ class StatusMonitor:    # 类: 监控逻辑核心
         if not self.is_running:
             return "STOP"
 
-        now = time.time()
+        now = time.monotonic()
         abs_val = abs(current_val)
 
         # 脉冲模式：仅检测信号丢失，跳过突变检测
@@ -1199,7 +1244,7 @@ class StatusMonitor:    # 类: 监控逻辑核心
 
         # 3. 填充历史数据
         # 如果历史数据太少，处于初始化阶段，不报警
-        if len(self.history) < 2:
+        if len(self.history) < min(2, self.history.maxlen):
             self.history.append(abs_val)
             return self.warning_state if self.warning_state != "RUN" else "INIT"
 
@@ -1288,8 +1333,6 @@ class MonitorSettingsDialog(QDialog):       #类: 设置对话框
         # 阈值换算: StatusMonitor 内部以 mA 存储, 界面按显示单位输入/展示,
         # 避免切换单位后阈值语义漂移 (Thresholds stored in mA internally;
         # entered/shown in the display unit so unit switches don't shift semantics)
-        factor = UNIT_FACTORS.get(unit, 1.0)
-
         # 1. 开关
         enable_cb = QtWidgets.QCheckBox("Enable Status Monitor")
         enable_cb.setChecked(monitor.enabled)
@@ -1303,10 +1346,7 @@ class MonitorSettingsDialog(QDialog):       #类: 设置对话框
         form.addRow("History Window:", window_spin)
 
         # 3. 零值阈值
-        zero_spin = QtWidgets.QDoubleSpinBox()
-        zero_spin.setRange(0.0, 99999.0)
-        zero_spin.setDecimals(4)
-        zero_spin.setValue(monitor.zero_threshold / factor)
+        zero_spin = CurrentSpinBox(monitor.zero_threshold, unit)
         zero_spin.setSuffix(f" {unit}")
         form.addRow("Zero Threshold:", zero_spin)
 
@@ -1346,10 +1386,7 @@ class MonitorSettingsDialog(QDialog):       #类: 设置对话框
         form.addRow("Threshold Mode:", mode_layout)
 
         # 5. 阈值数值
-        val_spin = QtWidgets.QDoubleSpinBox()
-        val_spin.setRange(0.0, 99999.0)
-        val_spin.setDecimals(4)
-        val_spin.setValue(monitor.spike_threshold / factor)
+        val_spin = CurrentSpinBox(monitor.spike_threshold, unit)
         val_spin.setSuffix(f" {unit}")
         form.addRow("Value Threshold:", val_spin)
 
@@ -1616,7 +1653,8 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         self.column_int1 = Decimal('0.0')  # 通道1电荷量
         self.column_int2 = Decimal('0.0')  # 通道2电荷量
         self.start_time = None
-        self.last_time = None
+        self.start_monotonic = None
+        self.last_sample_monotonic = None
         self.last_current1 = None  # 通道1上次电流值
         self.last_current2 = None  # 通道2上次电流值
         self.data_points = 100  # 显示的数据点数
@@ -1625,6 +1663,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         self.y_data2 = np.zeros(self.data_points)  # 通道2数据
         self.time_data = np.zeros(self.data_points)
         self.file_handle = None  # 文件句柄
+        self._write_error = None  # Latched until a new file/session opens successfully.
         self.filename = "Run_0000.csv"  # 默认文件名
         self.file_mode = "append"  # 默认文件模式：追加
         self.update_interval = 100  # 默认更新间隔100ms
@@ -1704,6 +1743,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         # (Parse cache: re-parse only when the log's mtime changes)
         self._gddaq_last_run_dir = None
         self._gddaq_last_parse = None
+        self._gddaq_log_error = None
 
         # DAQ 模式互斥标记: None / "daq_master" / "gddaq"
         self.active_daq_mode = None
@@ -2008,8 +2048,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.daq_timer.start()
             print("DAQ_Master Connection Enabled: Monitoring started.")
             self.log_bus.log("INFO", "DAQ_Master auto-link enabled")
-            self.save_status_label.setText("DAQ_Master Mode: Waiting for signal...")
-            self.save_status_label.setStyleSheet("color: blue;")
+            self._set_save_status("DAQ_Master Mode: Waiting for signal...", 'blue')
         else:
             self.active_daq_mode = None
             self.gddaq_connect_action.setEnabled(True)   # 恢复对方入口
@@ -2027,101 +2066,69 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.file_mode_combo.setEnabled(True)
             print("DAQ_Master Connection Disabled.")
             self.log_bus.log("INFO", "DAQ_Master auto-link disabled")
-            self.save_status_label.setText("DAQ_Master Mode: Disabled")
-            self.save_status_label.setStyleSheet("color: black;")
+            self._set_save_status("DAQ_Master Mode: Disabled", 'black')
 
     def check_daq_status(self):
-        """定时检查 DAQ 状态文件"""
-        if not os.path.exists(self.daq_status_file):
-            return
-
+        """Follow DAQ run identity; acknowledge a START only after it succeeds."""
         try:
             current_mtime = os.path.getmtime(self.daq_status_file)
-            
-            # 只有文件被修改过才读取
-            if current_mtime > self.daq_last_mtime:
-                self.daq_last_mtime = current_mtime
-                
-                # 读取文件内容
-                with open(self.daq_status_file, 'r') as f:
-                    lines = [line.strip() for line in f.readlines()]
-                
-                if not lines:
+            if current_mtime == self.daq_last_mtime:
+                return
+            with open(self.daq_status_file, "r") as f:
+                lines = [line.strip() for line in f]
+            if not lines:
+                return  # Writer may still be replacing the status; retry next poll.
+
+            if lines[0] == "STATUS: RUNNING":
+                self.daq_master_running = True
+                if len(lines) < 4 or not lines[1] or not lines[3]:
                     return
+                try:
+                    run_num = int(lines[2])
+                    if run_num < 0:
+                        raise ValueError("negative run number")
+                except ValueError:
+                    self._report_start_error("daq_master", "Invalid DAQ run number")
+                    return
+                filename = f"{lines[1]}_{run_num:05d}.csv"
+                save_dir = os.path.join(os.path.dirname(lines[3]), "current_data")
+                full_path = os.path.realpath(os.path.join(save_dir, filename))
 
-                status_line = lines[0]
-
-                if "STATUS: RUNNING" in status_line:
-                    # 维护外部运行标志 (即使本次 START 被忽略也要更新,
-                    # 供手动停止时的确认框判断 DAQ 是否仍在取数)
-                    # (Maintain the external-running flag even when this START
-                    #  is ignored; the manual-stop confirm dialog needs it)
-                    self.daq_master_running = True
-
-                    # 如果已经在运行，先不处理，或者可以选择重启监控
-                    if self.run_stat:
-                        print("DAQ Signal: START received, but already running. Ignoring.")
+                if self.run_stat:
+                    # Never take ownership of a manually started run.
+                    if (self.run_source != "daq_master"
+                            or os.path.realpath(self.filename) == full_path):
+                        self.daq_last_mtime = current_mtime
                         return
-
-                    if len(lines) >= 4:
-                        run_name = lines[1]
-                        try:
-                            run_num = int(lines[2])
-                        except ValueError:
-                            run_num = 0
-                        data_path = lines[3]
-
-                        # 1. 确定保存路径：data_path 的上一级 + current_data
-                        parent_dir = os.path.dirname(data_path)
-                        save_dir = os.path.join(parent_dir, "current_data")
-                        
-                        # 创建文件夹
-                        if not os.path.exists(save_dir):
-                            try:
-                                os.makedirs(save_dir, exist_ok=True)
-                            except Exception as e:
-                                print(f"Error creating directory: {e}")
-                                return
-
-                        # 2. 确定文件名：运行名称_运行编号 (5位)
-                        # 例如: run_00048.csv
-                        filename = f"{run_name}_{run_num:05d}.csv"
-                        full_path = os.path.join(save_dir, filename)
-
-                        # 3. 更新 UI 并启动
-                        self.filename_input.setText(full_path)
-                        print(f"DAQ Signal: START. File: {full_path}")
-                        self.log_bus.log("INFO", f"DAQ_Master signal: START (file={filename})")
-
-                        # 强制追加模式: DAQ 联动文件为新文件, 且避免在定时器回调中
-                        # 弹出模态覆盖确认框阻塞事件循环
-                        # (Force append mode: DAQ-linked files are new, and this
-                        #  avoids a modal overwrite-confirm dialog inside a timer callback)
-                        self.file_mode = "append"
-                        self.file_mode_combo.setCurrentIndex(0)
-
-                        self.start_monitoring(source="daq_master")
-                        
-                        # 更新状态提示
-                        self.save_status_label.setText(f"DAQ Linked: Running {filename}")
-                        self.save_status_label.setStyleSheet("color: green;")
-
-                elif "STATUS: STOPPED" in status_line:
-                    self.daq_master_running = False
-
-                    # 只停止由 DAQ_Master 触发的运行, 不干扰手动启动的运行
-                    # (Only stop runs triggered by DAQ_Master; never interrupt
-                    #  manually started runs)
-                    if self.run_stat and self.run_source == "daq_master":
-                        print("DAQ Signal: STOP received.")
-                        self.log_bus.log("INFO", "DAQ_Master signal: STOP")
-                        self.stop_monitoring(source="daq_master")
-                        self.save_status_label.setText("DAQ Linked: Stopped")
-                        self.save_status_label.setStyleSheet("color: orange;")
-
+                    # STOP can be missed between polls; a new identity still
+                    # closes the old CSV and resets the integrals.
+                    self.stop_monitoring(source="daq_master")
+                try:
+                    os.makedirs(save_dir, exist_ok=True)
+                except OSError as e:
+                    self._report_start_error("daq_master", "Cannot create save directory: " + str(e))
+                    return
+                self.filename_input.setText(full_path)
+                self.file_mode = "append"
+                self.file_mode_combo.setCurrentIndex(0)
+                self.start_monitoring(source="daq_master")
+                if not self.run_stat:
+                    return  # Keep the signal pending so transient failures retry.
+                self.log_bus.log("INFO", f"DAQ_Master signal: START (file={filename})")
+                self._set_save_status(f"DAQ Linked: Running {filename}", "green")
+            elif lines[0] == "STATUS: STOPPED":
+                self.daq_master_running = False
+                if self.run_stat and self.run_source == "daq_master":
+                    self.log_bus.log("INFO", "DAQ_Master signal: STOP")
+                    self.stop_monitoring(source="daq_master")
+                    self._set_save_status("DAQ Linked: Stopped", "orange")
+            else:
+                return
+            self.daq_last_mtime = current_mtime
+        except FileNotFoundError:
+            return
         except Exception as e:
-            print(f"Error checking DAQ status: {e}")
-            self.log_bus.log("WARNING", f"DAQ status file read error: {e}")
+            self._report_start_error("daq_master", "Cannot process DAQ status: " + str(e))
 
     # ===================== GDDAQ 联动功能 =====================
 
@@ -2419,10 +2426,9 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             print("GDDAQ Connection Enabled: Monitoring started.")
             self.log_bus.log("INFO", "GDDAQ auto-link enabled")
             if self.gddaq_detect_method == "memory":
-                self.save_status_label.setText("GDDAQ Mode: Waiting for memory-read signal...")
+                self._set_save_status("GDDAQ Mode: Waiting for memory-read signal...", "blue")
             else:
-                self.save_status_label.setText("GDDAQ Mode: Waiting for run.log signal...")
-            self.save_status_label.setStyleSheet("color: blue;")
+                self._set_save_status("GDDAQ Mode: Waiting for run.log signal...", "blue")
         else:
             # 关闭模式
             self.gddaq_timer.stop()
@@ -2445,8 +2451,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.file_mode_combo.setEnabled(True)
             print("GDDAQ Connection Disabled.")
             self.log_bus.log("INFO", "GDDAQ auto-link disabled")
-            self.save_status_label.setText("GDDAQ Mode: Disabled")
-            self.save_status_label.setStyleSheet("color: black;")
+            self._set_save_status("GDDAQ Mode: Disabled", 'black')
 
     def _exit_active_daq_link(self, reason):
         """手动干预导致退出联动模式 (Exit link mode due to manual intervention)
@@ -2588,9 +2593,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
 
     def _show_gddaq_running(self, run):
         self.gddaq_last_state = "RUNNING"
-        self.save_status_label.setText(
-            f"GDDAQ: Running run_{run:05d}.csv ({self.gddaq_detect_method})")
-        self.save_status_label.setStyleSheet("color: green;")
+        self._set_save_status(f"GDDAQ: Running run_{run:05d}.csv ({self.gddaq_detect_method})", 'green')
 
     def _gddaq_max_data_mtime(self, run_dir):
         """
@@ -2640,7 +2643,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         实测 (GUI-Qt 20260709 版): 同一 run 文件夹内重启取数时 gddaq 不会写入新的
         Start 行, 只在该段结束时追加一个 Stop 块 —— 重启的"开始"在 run.log 中不可见,
         只能依靠数据文件活动检测 (见 _gddaq_max_data_mtime)。
-        返回 (datetime, datetime or None, int)，解析失败返回 (None, None, 0)
+        返回 (datetime, datetime or None, int)，读取失败抛出异常供轮询重试。
         """
         start_time = None
         stop_time = None
@@ -2669,8 +2672,9 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                                 stop_count += 1
                             except ValueError:
                                 pass
-        except Exception:
-            pass
+        except (OSError, UnicodeError):
+            # Let the poller retry rather than cache a failed/partial read.
+            raise
 
         return start_time, stop_time, stop_count
 
@@ -2683,8 +2687,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             if not self.gddaq_dir_invalid_logged:
                 self.log_bus.log("WARNING", "GDDAQ data directory became invalid")
                 self.gddaq_dir_invalid_logged = True
-            self.save_status_label.setText("GDDAQ: data directory invalid!")
-            self.save_status_label.setStyleSheet("color: red;")
+            self._set_save_status("GDDAQ: data directory invalid!", 'red')
             # Still detect a confirmed process exit when the filesystem is unavailable.
             if not self.is_gddaq_running():
                 self._stop_gddaq_recording()
@@ -2697,6 +2700,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self._stop_gddaq_recording()
             self._gddaq_last_run_dir = run_dir
             self._gddaq_last_parse = None
+            self._gddaq_log_error = None
             self.gddaq_last_log_mtime = 0
             self.gddaq_last_state = "IDLE"
             self.gddaq_follow_stop_count = 0
@@ -2704,8 +2708,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.gddaq_finished_since = None
             self.gddaq_last_alive_time = None
             self._start_error_key = None
-            self.save_status_label.setText(f"GDDAQ: {run_id} waiting for Start...")
-            self.save_status_label.setStyleSheet("color: blue;")
+            self._set_save_status(f"GDDAQ: {run_id} waiting for Start...", 'blue')
 
         proc_alive = self.is_gddaq_running()
         if self.gddaq_proc_alive_last is not None and self.gddaq_proc_alive_last != proc_alive:
@@ -2716,8 +2719,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                 self._stop_gddaq_recording()
                 self.gddaq_last_state = "CRASHED"
                 self.log_bus.log("WARNING", "GDDAQ process not found; recording stopped")
-            self.save_status_label.setText("GDDAQ: process not found! Waiting for restart.")
-            self.save_status_label.setStyleSheet("color: red;")
+            self._set_save_status("GDDAQ: process not found! Waiting for restart.", 'red')
             return
         if run_dir is None:
             return
@@ -2727,7 +2729,19 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         except OSError:
             return
         if current_log_mtime != self.gddaq_last_log_mtime or self._gddaq_last_parse is None:
-            self._gddaq_last_parse = self.parse_gddaq_run_log(log_path)
+            try:
+                parsed = self.parse_gddaq_run_log(log_path)
+            except (OSError, UnicodeError) as e:
+                error = str(e)
+                if error != self._gddaq_log_error:
+                    self.log_bus.log("WARNING", "Cannot read GDDAQ run.log: " + error)
+                    self._gddaq_log_error = error
+                self._set_save_status("GDDAQ: cannot read run.log; retrying...", "red")
+                return
+            if self._gddaq_log_error is not None:
+                self.log_bus.log("INFO", "GDDAQ run.log read recovered")
+                self._gddaq_log_error = None
+            self._gddaq_last_parse = parsed
             self.gddaq_last_log_mtime = current_log_mtime
         start_time, stop_time, stop_count = self._gddaq_last_parse
         if start_time is None:
@@ -2750,24 +2764,21 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.gddaq_fin_stop_count = stop_count
             self.gddaq_finished_since = now
             self.log_bus.log("INFO", f"GDDAQ: run {run_id} segment finished")
-            self.save_status_label.setText(f"GDDAQ: Run {run_id} Finished")
-            self.save_status_label.setStyleSheet("color: green;")
+            self._set_save_status(f"GDDAQ: Run {run_id} Finished", 'green')
             return
         if self.gddaq_last_state != "FINISHED":
             self._stop_gddaq_recording()
             self.gddaq_last_state = "FINISHED"
             self.gddaq_fin_stop_count = stop_count
             self.gddaq_finished_since = now
-            self.save_status_label.setText(f"GDDAQ: Run {run_id} Finished")
-            self.save_status_label.setStyleSheet("color: green;")
+            self._set_save_status(f"GDDAQ: Run {run_id} Finished", 'green')
             return
         if stop_count > self.gddaq_fin_stop_count:
             self.log_bus.log("WARNING", f"GDDAQ: missed restarted acquisition in run {run_id} "
                              "(too short or under one data-flush block)")
             self.gddaq_fin_stop_count = stop_count
             self.gddaq_finished_since = now
-            self.save_status_label.setText(f"GDDAQ: Run {run_id} missed a restarted acquisition!")
-            self.save_status_label.setStyleSheet("color: orange;")
+            self._set_save_status(f"GDDAQ: Run {run_id} missed a restarted acquisition!", 'orange')
         grace_ok = (self.gddaq_finished_since is None or
                     (now - self.gddaq_finished_since).total_seconds() > self.gddaq_restart_grace)
         if (grace_ok and self._gddaq_max_data_mtime(run_dir)
@@ -2787,16 +2798,14 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
     def _gddaq_mem_unavailable(self, reason, immediate=False):
         """错误心跳不能延长 3 秒宽限期 (error heartbeats are not valid DAQ states)."""
         if not immediate and time.monotonic() - self._gddaq_mem_last_valid < 3.0:
-            self.save_status_label.setText("GDDAQ: waiting for valid memory status (3s grace)...")
-            self.save_status_label.setStyleSheet("color: orange;")
+            self._set_save_status("GDDAQ: waiting for valid memory status (3s grace)...", 'orange')
             return
         self._stop_gddaq_recording()
         self.gddaq_last_state = "CRASHED"
         if self._gddaq_mem_fault != reason:
             self.log_bus.log("WARNING", "GDDAQ: " + reason)
             self._gddaq_mem_fault = reason
-        self.save_status_label.setText("GDDAQ: " + reason)
-        self.save_status_label.setStyleSheet("color: red;")
+        self._set_save_status("GDDAQ: " + reason, 'red')
 
     def check_gddaq_mem_status(self):
         """Follow valid snapshots without a GUI edge gate; retries and recovery are idempotent.
@@ -2860,8 +2869,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         else:
             self._stop_gddaq_recording()
             self.gddaq_last_state = "FINISHED"
-            self.save_status_label.setText("GDDAQ: Finished (memory)")
-            self.save_status_label.setStyleSheet("color: green;")
+            self._set_save_status("GDDAQ: Finished (memory)", 'green')
 
     # ===================== GDDAQ 联动功能结束 =====================
 
@@ -3126,13 +3134,11 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                 serialport.close()
                 
                 QMessageBox.information(self, "Test Successful", f"{channel_name} Serial Port Test Successful!")
-                self.save_status_label.setText(f"{channel_name} Serial Port Test: Successful")
-                self.save_status_label.setStyleSheet("color: green;")
+                self._set_save_status(f"{channel_name} Serial Port Test: Successful", 'green')
                 self.log_bus.log("INFO", f"Channel {channel} serial port test successful")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"{channel_name} Serial Port Test Failed: {str(e)}")
-                self.save_status_label.setText(f"{channel_name} Serial Port Test: Failed - {str(e)}")
-                self.save_status_label.setStyleSheet("color: red;")
+                self._set_save_status(f"{channel_name} Serial Port Test: Failed - {str(e)}", 'red')
                 self.log_bus.log("WARNING", f"Channel {channel} serial port test failed: {e}")
         
         else:
@@ -3151,13 +3157,11 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                 s.close()
                 
                 QMessageBox.information(self, "Connect Successful", f"{channel_name} Network Connect Successful!")
-                self.save_status_label.setText(f"{channel_name} Network Test: Successful")
-                self.save_status_label.setStyleSheet("color: green;")
+                self._set_save_status(f"{channel_name} Network Test: Successful", 'green')
                 self.log_bus.log("INFO", f"Channel {channel} network test successful")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"{channel_name} Network Test Failed: {str(e)}")
-                self.save_status_label.setText(f"{channel_name} Network Test: Failed - {str(e)}")
-                self.save_status_label.setStyleSheet("color: red;")
+                self._set_save_status(f"{channel_name} Network Test: Failed - {str(e)}", 'red')
                 self.log_bus.log("WARNING", f"Channel {channel} network test failed: {e}")
 
     
@@ -3201,8 +3205,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                                         f"File '{self.filename}' Exists. Are You Sure You Want to Overwrite?",
                                         QMessageBox.Yes | QMessageBox.No)
                 if reply == QMessageBox.No:
-                    self.save_status_label.setText("Save Status: User Canceled Overwrite Operation")
-                    self.save_status_label.setStyleSheet("color: orange;")
+                    self._set_save_status("Save Status: User Canceled Overwrite Operation", 'orange')
                     return False
             
             # 在追加模式下，先检查文件末尾是否需要换行符
@@ -3245,8 +3248,8 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             # Fail startup now if the header/session marker cannot be flushed.
             # 表头/会话标记落盘失败也属于启动失败, 不能先显示运行中。
             self.file_handle.flush()
-            self.save_status_label.setText(f"Save Status: Saving to {self.filename} ({'Overwrite' if mode == 'w' else 'Append'})")
-            self.save_status_label.setStyleSheet("color: green;")
+            self._write_error = None
+            self._set_save_status(f"Save Status: Saving to {self.filename} ({'Overwrite' if mode == 'w' else 'Append'})", 'green')
             print(f"Data File Opened: {self.filename} (Mode: {mode})")
             return True
         except Exception as e:
@@ -3258,8 +3261,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                     pass
                 self.file_handle = None
             self._data_file_error = str(e)
-            self.save_status_label.setText(f"Save Status: File Open Failed - {str(e)}")
-            self.save_status_label.setStyleSheet("color: red;")
+            self._set_save_status(f"Save Status: File Open Failed - {str(e)}", 'red')
             return False
     
     def close_data_file(self):
@@ -3267,11 +3269,11 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         if self.file_handle:
             try:
                 self.file_handle.close()
-                self.save_status_label.setText(f"Save Status: Saved to {self.filename}")
+                self._set_save_status(f"Save Status: Saved to {self.filename}", "green")
                 print(f"Data File Closed: {self.filename}")
             except Exception as e:
-                self.save_status_label.setText(f"Save Status: File Close Failed - {str(e)}")
-                self.save_status_label.setStyleSheet("color: red;")
+                self._write_error = f"{self.filename}: close failed: {e}"
+                self._set_save_status(f"Save Status: File Close Failed - {str(e)}", 'red')
                 print(f"Failed to Close Data File: {e}")
                 self.log_bus.log("ERROR", f"Data file close failed: {e}")
             finally:
@@ -3287,9 +3289,20 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.file_handle.write(f"{time_val:.1f},{runtime:.4f},{current1:.8e},{current2:.8e},{integral1:.4e},{integral2:.4e}\n")
             self.file_handle.flush()  # 确保数据立即写入
         except Exception as e:
-            self.save_status_label.setText(f"Save Status: Write Failed - {str(e)}")
-            self.save_status_label.setStyleSheet("color: red;")
-            print(f"Failed to Write Data: {e}")
+            error = f"{self.filename}: {e}"
+            if error != self._write_error:
+                self.log_bus.log("ERROR", "Data write failed: " + error)
+                print(f"Failed to Write Data: {e}")
+            self._write_error = error
+            self._set_save_status("Save Status: Data may be incomplete", "red")
+
+    def _set_save_status(self, text, color):
+        """Keep data loss visible across DAQ polls, snapshots and shutdown."""
+        if self._write_error is not None:
+            text += "\nWrite Failed: " + self._write_error + " (data may be incomplete)"
+            color = "red"
+        self.save_status_label.setText(text)
+        self.save_status_label.setStyleSheet(f"color: {color};")
     
     def create_snapshot(self):
         """创建当前数据的独立快照副本"""
@@ -3333,7 +3346,8 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             # 在快照文件中添加元数据
             # 直接使用运行时变量, 而非反解析 UI 标签文本 (与界面文案解耦)
             # (Use the live values directly instead of re-parsing label text)
-            run_seconds = (time.time() - self.start_time) if self.start_time else 0.0
+            run_seconds = (time.monotonic() - self.start_monotonic
+                           if self.start_monotonic is not None else 0.0)
             hh = int(run_seconds // 3600)
             mm = int((run_seconds - hh * 3600) // 60)
             ss = run_seconds - hh * 3600 - mm * 60
@@ -3363,8 +3377,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             msg.exec_()
             
             # 更新状态栏
-            self.save_status_label.setText(f"Snapshot Status: Created {os.path.basename(snapshot_file)}")
-            self.save_status_label.setStyleSheet("color: blue;")
+            self._set_save_status(f"Snapshot Status: Created {os.path.basename(snapshot_file)}", 'blue')
             
             print(f"Data Snapshot Created: {snapshot_file}")
             self.log_bus.log("INFO", f"Snapshot created: {os.path.basename(snapshot_file)}")
@@ -3373,8 +3386,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         except Exception as e:
             error_msg = f"Snapshot Creation Failed: {str(e)}"
             QMessageBox.critical(self, "Error", error_msg)
-            self.save_status_label.setText(f"Snapshot Status: {error_msg}")
-            self.save_status_label.setStyleSheet("color: red;")
+            self._set_save_status(f"Snapshot Status: {error_msg}", 'red')
             print(f"Failed to Create Data Snapshot: {e}")
             self.log_bus.log("ERROR", f"Snapshot failed: {e}")
             return False
@@ -3605,8 +3617,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         if source == "manual" or key != self._start_error_key:
             self.log_bus.log("ERROR", f"Start failed ({source}): {message}")
             self._start_error_key = key
-        self.save_status_label.setText(f"Start failed: {message}")
-        self.save_status_label.setStyleSheet("color: red;")
+        self._set_save_status(f"Start failed: {message}", 'red')
         if source == "manual":
             QMessageBox.critical(self, "Error", message)
 
@@ -3742,7 +3753,8 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
 
         # 初始化计时和数据
         self.start_time = self.get_time()
-        self.last_time = self.start_time
+        self.start_monotonic = time.monotonic()
+        self.last_sample_monotonic = self.start_monotonic
         self.column_int1 = Decimal('0.0')  # 重置通道1电荷量
         self.column_int2 = Decimal('0.0')  # 重置通道2电荷量
         self.last_current1 = None  # 重置通道1上次电流值
@@ -3924,9 +3936,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         self.browse_button.setEnabled(not daq_linked)
         self.file_mode_combo.setEnabled(not daq_linked)
 
-        # 停止脉冲提醒定时器
-        if self.pulse_reminder_timer.isActive():
-            self.pulse_reminder_timer.stop()
+        self._dismiss_pulse_reminder()
 
         # 停止 ZERO 报警音
         if self.alarm_active:
@@ -4162,32 +4172,28 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         layout.addWidget(QLabel("Channel 1 Max Limit:"), 0, 0)
         
         # 数值输入框
-        spin1 = QtWidgets.QDoubleSpinBox()
-        spin1.setRange(0, 999999) # 设置范围
-        spin1.setDecimals(4)      # 设置小数位
-        spin1.setValue(self.limit_ch1_ma) # 默认显示当前的mA值
+        spin1 = CurrentSpinBox(self.limit_ch1_ma, maximum_ma=999999.0)
         layout.addWidget(spin1, 0, 1)
         
         # 单位选择框
         combo1 = QComboBox()
         combo1.addItems(["mA", "μA", "nA"])
         combo1.setCurrentText("mA") # 默认显示单位为mA，因为spinbox里填的是mA值
+        combo1.currentTextChanged.connect(spin1.set_unit)
         layout.addWidget(combo1, 0, 2)
         
         # 通道 2 设置
         layout.addWidget(QLabel("Channel 2 Max Limit:"), 1, 0)
         
         # 数值输入框
-        spin2 = QtWidgets.QDoubleSpinBox()
-        spin2.setRange(0, 999999)
-        spin2.setDecimals(4)
-        spin2.setValue(self.limit_ch2_ma)
+        spin2 = CurrentSpinBox(self.limit_ch2_ma, maximum_ma=999999.0)
         layout.addWidget(spin2, 1, 1)
         
         # 单位选择框
         combo2 = QComboBox()
         combo2.addItems(["mA", "μA", "nA"])
         combo2.setCurrentText("mA")
+        combo2.currentTextChanged.connect(spin2.set_unit)
         layout.addWidget(combo2, 1, 2)
         
         # 说明标签
@@ -4259,13 +4265,23 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
         print(f"Pulse reminder {status}")
         
         # 如果关闭提醒且定时器正在运行，停止定时器
-        if not self.pulse_reminder_enabled and self.pulse_reminder_timer.isActive():
-            self.pulse_reminder_timer.stop()
+        if not self.pulse_reminder_enabled:
+            self._dismiss_pulse_reminder()
+
+    def _dismiss_pulse_reminder(self):
+        self.pulse_reminder_timer.stop()
+        dialog = self._reminder_dialog
+        self._reminder_dialog = None
+        if dialog is not None:
+            try:
+                dialog.accept()
+            except RuntimeError:
+                pass  # WA_DeleteOnClose may already have destroyed it.
 
     def show_pulse_reminder(self):
         """显示脉冲提醒对话框 (非模态, 不阻塞数据采集)
         Show the pulse reminder (modeless so data acquisition keeps running)."""
-        if not self.pulse_reminder_enabled or self.reminder_suppressed:
+        if not self.run_stat or not self.pulse_reminder_enabled or self.reminder_suppressed:
             return
         # 已有提醒窗口未关闭时不重复弹出; WA_DeleteOnClose 销毁后访问会抛
         # RuntimeError, 捕获后清空引用 (Don't stack reminders; a destroyed
@@ -4329,7 +4345,12 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
 
     def handle_reminder_choice(self, dialog, choice):
         """处理用户的提醒选择"""
+        if dialog is not self._reminder_dialog:
+            return  # Ignore callbacks belonging to an earlier run/dialog.
+        self._reminder_dialog = None
         dialog.accept()  # 关闭对话框
+        if not self.run_stat or not self.pulse_reminder_enabled:
+            return
         
         if choice == "no_more":
             # 本轮内不再提醒
@@ -4396,7 +4417,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             
             # 计算运行时间
             if self.start_time and time_val > 0:
-                runtime = time_val - self.start_time
+                runtime = time_val
                 time_str = f"{runtime:.2f}s"
             else:
                 time_str = "N/A"
@@ -4661,6 +4682,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
 
     def closeEvent(self, event):
         """关闭事件，确保资源被正确释放"""
+        self._dismiss_pulse_reminder()
         # 停止 DAQ/GDDAQ 轮询定时器 (Stop DAQ/GDDAQ polling timers)
         self.daq_timer.stop()
         self.gddaq_timer.stop()
@@ -4736,11 +4758,11 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             #  both channels aligned — but each channel's debounce state was
             #  updated independently above)
             if not ch1_ok or not ch2_ok:
-                # 中断期间不计入积分: 推进 last_time 并断开梯形基线,
+                # 中断期间不计入积分: 推进单调时钟基线并断开梯形基线,
                 # 防止恢复后 delta_t 跨越中断期导致电荷虚增
-                # (Skip integration across the gap: bump last_time and reset the
+                # (Skip integration across the gap: bump the monotonic time and reset the
                 #  trapezoid baseline so no phantom charge accumulates on recovery)
-                self.last_time = self.get_time()
+                self.last_sample_monotonic = time.monotonic()
                 self.last_current1 = None
                 self.last_current2 = None
                 return
@@ -4769,21 +4791,22 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
                 if invalid_ch2:
                     print(f"Invalid Current Ch2 (mA): {current2_ma}, Skipping Frame")
                 # 被过滤期间同样不计入积分 (skip integration across the gap)
-                self.last_time = self.get_time()
+                self.last_sample_monotonic = time.monotonic()
                 self.last_current1 = None
                 self.last_current2 = None
                 return
             
             # 获取当前时间
             now = self.get_time()
+            sample_monotonic = time.monotonic()
             local_time = time.localtime(now)
             utc_time = time.gmtime(now)
             local_time_str = time.strftime("%Y-%m-%d %H:%M:%S (UTC%z)", local_time)
             utc_time_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", utc_time)
             
             # 4. 积分计算 (必须使用 mA 值，确保积分单位是 mC)
-            if self.last_time is not None:
-                delta_t = now - self.last_time
+            if self.last_sample_monotonic is not None:
+                delta_t = sample_monotonic - self.last_sample_monotonic
                 
                 if delta_t > 0:
                     # 通道1积分
@@ -4805,10 +4828,10 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             # 保存当前的 mA 值用于下次积分计算
             self.last_current1 = current1_ma
             self.last_current2 = current2_ma
-            self.last_time = now
+            self.last_sample_monotonic = sample_monotonic
             
             # 5. 更新 UI 显示 (显示原始数值 + 当前单位)
-            runtime = now - self.start_time
+            runtime = sample_monotonic - self.start_monotonic
             h = int(runtime // 3600)
             m = int((runtime - h * 3600) // 60)
             s = runtime - h * 3600 - m * 60
@@ -4837,7 +4860,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             self.y_data2[-1] = current2
             
             self.time_data = np.roll(self.time_data, -1)
-            self.time_data[-1] = now
+            self.time_data[-1] = runtime
             
             # 更新曲线
             self.line1.set_ydata(self.y_data1)
@@ -4854,7 +4877,7 @@ class RealTimePlotApp(QMainWindow):     # 类: 主应用窗口
             tick_labels = []
             for i in tick_indices:
                 t = self.time_data[i]
-                time_sec = (t - self.start_time) if t > 0 else 0
+                time_sec = t
                 tick_labels.append(f"{time_sec:.1f}")
             self.ax.set_xticks(tick_indices)
             self.ax.set_xticklabels(tick_labels)
